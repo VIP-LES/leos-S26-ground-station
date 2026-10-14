@@ -148,7 +148,7 @@ def insert_sensors_and_gps_row(row: dict) -> bool:
              gps_sats_visible)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s)
+                %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (time) DO NOTHING
     """
     values = (

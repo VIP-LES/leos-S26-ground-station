@@ -10,3 +10,5 @@ node_modules/
 .ruff_cache/
 launch_data.txt
 send_cursor.txt
+grafana/plugins/
+timescale_data/
