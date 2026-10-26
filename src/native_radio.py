@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 
 from src import queue_writer
-from src.telemetry_decoder import decode_rf_frame_to_ingest_payload
+from src.protobuf_decoder import decode_radio_frame
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +177,7 @@ def run_native_radio(
                 frame = message[2:]
                 logger.debug("RX frame from radio %d len=%d", radio_id, len(frame))
                 try:
-                    message_type, payload = decode_rf_frame_to_ingest_payload(frame)
+                    message_type, payload = decode_radio_frame(frame)
                 except Exception:
                     stats.decode_fail += 1
                     logger.exception(

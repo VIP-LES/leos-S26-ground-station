@@ -34,6 +34,7 @@ from src.native_radio import run_native_radio  # noqa: E402
 from src.forwarder import run_forwarder  # noqa: E402
 from src.ingest_api import app  # noqa: E402
 from src.queue_writer import init_queue  # noqa: E402
+from src.python_radio import run_python_radio  # noqa: E402
 from src.replay_radio import run_replay_radio  # noqa: E402
 
 logging.basicConfig(
@@ -113,6 +114,14 @@ def run_pi_mode() -> None:
         )
         producer_thread.start()
         logger.info("Native radio receiver started via %s", radio_socket_path)
+    elif radio_source == "python":
+        producer_thread = threading.Thread(
+            target=run_python_radio,
+            kwargs={"queue_path": queue_path},
+            daemon=True,
+        )
+        producer_thread.start()
+        logger.info("Python SX1262 radio source started (protobuf decode)")
     else:
         logger.info("Pi mode started without an active radio source; forwarder will idle")
 

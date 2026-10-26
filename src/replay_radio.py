@@ -7,8 +7,8 @@ import logging
 import time
 
 from src import queue_writer
+from src.protobuf_decoder import decode_radio_hex
 from src.telemetry_decoder import (
-    decode_hex_frame_to_ingest_payload,
     decode_rf_frame,
     encode_rf_frame,
     rf_payload_to_ingest_payload,
@@ -30,7 +30,7 @@ def _decode_record(line: str) -> tuple[str, dict]:
     if line.startswith("{"):
         record = json.loads(line)
         if "frame_hex" in record:
-            return decode_hex_frame_to_ingest_payload(record["frame_hex"])
+            return decode_radio_hex(record["frame_hex"])
 
         message_type = record["message_type"]
         payload = record["payload"]
@@ -38,7 +38,7 @@ def _decode_record(line: str) -> tuple[str, dict]:
         decoded_message_type, decoded_payload = decode_rf_frame(frame)
         return decoded_message_type, rf_payload_to_ingest_payload(decoded_message_type, decoded_payload)
 
-    return decode_hex_frame_to_ingest_payload(line)
+    return decode_radio_hex(line)
 
 
 def run_replay_radio(

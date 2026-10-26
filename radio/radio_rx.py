@@ -124,7 +124,7 @@ class SX1262:
                 "crc_ok": not (irq & IRQ_CRC_ERR), "hex": data.hex()}
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--freq", type=int, default=915_000_000)
     p.add_argument("--sf", type=int, default=7)
@@ -147,7 +147,11 @@ def main():
                    help="DIO2 controls the RF switch (default on)")
     p.add_argument("--ldo", action=argparse.BooleanOptionalAction, default=True,
                    help="use LDO regulator (default on; --no-ldo for DC-DC)")
-    a = p.parse_args()
+    return p
+
+
+def main():
+    a = build_parser().parse_args()
 
     radio = SX1262(a)
     radio.configure()
