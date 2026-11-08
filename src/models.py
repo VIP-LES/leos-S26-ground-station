@@ -4,10 +4,12 @@ from pydantic import BaseModel
 
 SENSORS_AND_GPS = "sensors_and_gps"
 EFM = "efm"
+GEIGER = "geiger"
 
 INGEST_PATHS = {
     SENSORS_AND_GPS: "/ingest/sensors-and-gps",
     EFM: "/ingest/efm",
+    GEIGER: "/ingest/geiger",
 }
 
 
@@ -48,10 +50,29 @@ class SensorsAndGpsPayload(BaseModel):
 
 
 class EfmPayload(BaseModel):
-    """Structured EFM telemetry payload."""
+    """Structured EFM telemetry payload.
+
+    The adc* fields are the older raw-sample format. The efm0_* / efm1_* fields are the
+    interval summaries (avg/min/max sample and hall events) from the two field mills.
+    """
 
     time: str
     adc1_ch1_diff: float | None = None
     adc1_ch4_breakbeam: float | None = None
     adc2_ch1_diff: float | None = None
     adc2_ch4_breakbeam: float | None = None
+    efm0_avg_sample: float | None = None
+    efm0_min_sample: float | None = None
+    efm0_max_sample: float | None = None
+    efm0_hall_events: int | None = None
+    efm1_avg_sample: float | None = None
+    efm1_min_sample: float | None = None
+    efm1_max_sample: float | None = None
+    efm1_hall_events: int | None = None
+
+
+class GeigerPayload(BaseModel):
+    """Geiger counter telemetry payload."""
+
+    time: str
+    hits_in_interval: int | None = None

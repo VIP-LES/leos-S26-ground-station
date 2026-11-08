@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from src import db
-from src.models import EfmPayload, SensorsAndGpsPayload
+from src.models import EfmPayload, GeigerPayload, SensorsAndGpsPayload
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,17 @@ def _validate_optional_time(time_str: str | None) -> JSONResponse | None:
     return _validate_time(time_str)
 
 
+def _result(inserted: bool, time_str: str, message_type: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=201 if inserted else 200,
+        content={
+            "status": "inserted" if inserted else "duplicate, skipped",
+            "time": time_str,
+            "message_type": message_type,
+        },
+    )
+
+
 @app.post("/ingest/sensors-and-gps")
 def ingest_sensors_and_gps(payload: SensorsAndGpsPayload):
     error = _validate_time(payload.time)
@@ -52,14 +63,7 @@ def ingest_sensors_and_gps(payload: SensorsAndGpsPayload):
         logger.error("Sensors/GPS insert failed: %s", exc)
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
-    return JSONResponse(
-        status_code=201 if inserted else 200,
-        content={
-            "status": "inserted" if inserted else "duplicate, skipped",
-            "time": payload.time,
-            "message_type": "sensors_and_gps",
-        },
-    )
+    return _result(inserted, payload.time, "sensors_and_gps")
 
 
 @app.post("/ingest/efm")
@@ -74,11 +78,19 @@ def ingest_efm(payload: EfmPayload):
         logger.error("EFM insert failed: %s", exc)
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
-    return JSONResponse(
-        status_code=201 if inserted else 200,
-        content={
-            "status": "inserted" if inserted else "duplicate, skipped",
-            "time": payload.time,
-            "message_type": "efm",
-        },
-    )
+    return _result(inserted, payload.time, "efm")
+
+
+@app.post("/ingest/geiger")
+def ingest_geiger(payload: GeigerPayload):
+    error = _validate_time(payload.time)
+    if error is not None:
+        return error
+
+    try:
+        inserted = db.insert_geiger_row(payload.model_dump())
+    except Exception as exc:
+        logger.error("Geiger insert failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    return _result(inserted, payload.time, "geiger")

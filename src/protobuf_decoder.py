@@ -1,9 +1,15 @@
 """Protobuf (leos-protobufs) radio packet decoding for the ground station.
 
-The Pico transmits a ``leos.Packet`` protobuf message (see leos-protobufs/proto/packet.proto).
-This module turns it into the same ``(message_type, ingest_payload)`` pair that
+The Pico transmits a ``leos.Packet`` protobuf message (see leos-protobufs/proto/packet.proto,
+branch ``luke``). This module turns it into the same ``(message_type, ingest_payload)`` pair that
 ``telemetry_decoder.decode_rf_frame_to_ingest_payload`` returns for the legacy 0xA5 frame, so
 everything downstream (queue, forwarder, ingest API, TimescaleDB, Grafana) is unchanged.
+
+Schema (current): Packet.telemetry is a TelemetryPacket with optional sub-messages
+``purple`` (PurpleboardData, including ``air``), ``beacon`` (GPS + health), ``efm0``/``efm1``
+(interval summaries) and ``geiger``. One packet can carry several of these, so decoding returns a
+list of ``(message_type, payload)`` pairs: ``purple`` + ``beacon`` become ``sensors_and_gps``,
+``efm0`` / ``efm1`` become one ``efm`` row, and ``geiger`` becomes a ``geiger`` row.
 
 Setup: clone leos-protobufs (branch ``luke``) next to this repo, or point LEOS_PROTOBUF_PATH at it.
 The generated Python modules need ``protobuf>=7.35.1`` (they check the runtime version on import).
@@ -17,16 +23,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.models import EFM, SENSORS_AND_GPS
+from src.models import EFM, GEIGER, SENSORS_AND_GPS
 from src.telemetry_decoder import SYNC_BYTE, decode_rf_frame_to_ingest_payload
 
 logger = logging.getLogger(__name__)
 
 # gps.proto: fix is 1=no fix, 2=2D, 3=3D
 MIN_FIX_FOR_GPS_OK = 2
-# efm.proto ADC.id -> columns in efm_data. The firmware's id numbering (1-based assumed) is
-# not documented in the .proto, so ids outside this map are skipped with a warning.
-EFM_ADC_ID_TO_PREFIX = {1: "adc1", 2: "adc2"}
 
 _packet_pb2 = None
 
@@ -94,22 +97,34 @@ def parse_packet(data: bytes):
     return packet
 
 
-def _low_rate_to_ingest(low_rate, received_at: datetime) -> dict:
+def _telemetry_to_ingest(telemetry, received_at: datetime) -> dict:
+    """Build a sensors_and_gps ingest payload from purple + beacon."""
     payload: dict = {"time": _utc_iso(received_at)}
 
-    if low_rate.HasField("sensors"):
-        s = low_rate.sensors
+    if telemetry.HasField("purple"):
+        p = telemetry.purple
         payload.update(
-            temperature=s.temperature,
-            pressure=s.pressure,
-            humidity=s.humidity,
-            light_lux=s.light_lux,
-            gas_resistance=s.gas_resistance,
-            # s.uvi (UV index) has no column yet; ltr390 "uvs" is a different quantity.
+            temperature=p.temperature,
+            pressure=p.pressure,
+            humidity=p.humidity,
+            light_lux=p.light_lux,
+            gas_resistance=p.gas_resistance,
+            # The radio currently sends the raw LTR390 count in the "uvi" field, which matches
+            # the "uvs" column. If the firmware later sends a real UV index, add a uvi column.
+            uvs=p.uvi,
         )
+        if p.HasField("air"):
+            a = p.air
+            payload.update(
+                pm10_env=a.pm10_env,      # PM1.0, ug/m3
+                pm25_env=a.pm25_env,      # PM2.5, ug/m3
+                pm100_env=a.pm100_env,    # PM10, ug/m3
+                aqi_pm25_us=a.aqi_pm25_us,
+                aqi_pm100_us=a.aqi_pm100_us,
+            )
 
-    if low_rate.HasField("beacon") and low_rate.beacon.HasField("gps"):
-        g = low_rate.beacon.gps
+    if telemetry.HasField("beacon") and telemetry.beacon.HasField("gps"):
+        g = telemetry.beacon.gps
         payload.update(
             gps_utc=_unix_ms_to_iso(g.utc_unix_ms),
             gps_fix_ok=g.fix >= MIN_FIX_FOR_GPS_OK,
@@ -122,25 +137,27 @@ def _low_rate_to_ingest(low_rate, received_at: datetime) -> dict:
     return payload
 
 
-def _efm_to_ingest(efm, received_at: datetime) -> dict:
+def _efm_to_ingest(telemetry, received_at: datetime) -> dict | None:
+    """efm0 / efm1 interval summaries -> one efm row. None if neither is present."""
     payload: dict = {"time": _utc_iso(received_at)}
-    for adc in efm.adc:
-        prefix = EFM_ADC_ID_TO_PREFIX.get(adc.id)
-        if prefix is None:
-            logger.warning("Skipping EFM ADC with unexpected id %d", adc.id)
-            continue
-        payload[f"{prefix}_ch1_diff"] = adc.ch1_diff
-        payload[f"{prefix}_ch4_breakbeam"] = adc.ch4_breakbeam
-        # ch2_phase1 / ch3_phase2 have no columns in efm_data.
-    return payload
+    found = False
+    for n, name in ((0, "efm0"), (1, "efm1")):
+        if telemetry.HasField(name):
+            e = getattr(telemetry, name)
+            payload[f"efm{n}_avg_sample"] = e.avg_sample
+            payload[f"efm{n}_min_sample"] = e.min_sample
+            payload[f"efm{n}_max_sample"] = e.max_sample
+            payload[f"efm{n}_hall_events"] = e.hall_events_in_interval
+            found = True
+    return payload if found else None
 
 
-def decode_protobuf_packet(data: bytes, received_at: datetime | None = None) -> tuple[str, dict]:
-    """Decode a ``leos.Packet`` into ``(message_type, ingest_payload)``.
+def decode_protobuf_messages(data: bytes, received_at: datetime | None = None) -> list[tuple[str, dict]]:
+    """Decode a ``leos.Packet`` into a list of ``(message_type, ingest_payload)`` pairs.
 
     ``time`` is the ground-station receive time: the packet's timestamp_ms is the sender's
-    uptime, not UTC. Raises ValueError for undecodable packets and for payload kinds the
-    ground station does not ingest (commands, empty payloads).
+    uptime, not UTC. Raises ValueError for undecodable packets and for packets that carry
+    nothing the ground station ingests (commands, empty telemetry).
     """
     received_at = received_at or datetime.now(timezone.utc)
     packet = parse_packet(data)
@@ -150,12 +167,29 @@ def decode_protobuf_packet(data: bytes, received_at: datetime | None = None) -> 
         raise ValueError(f"Unsupported packet payload: {kind!r}")
 
     telemetry = packet.telemetry
-    data_kind = telemetry.WhichOneof("data")
-    if data_kind == "low_rate":
-        return SENSORS_AND_GPS, _low_rate_to_ingest(telemetry.low_rate, received_at)
-    if data_kind == "efm":
-        return EFM, _efm_to_ingest(telemetry.efm, received_at)
-    raise ValueError(f"Unsupported telemetry data: {data_kind!r}")
+    messages: list[tuple[str, dict]] = []
+
+    if telemetry.HasField("purple") or telemetry.HasField("beacon"):
+        messages.append((SENSORS_AND_GPS, _telemetry_to_ingest(telemetry, received_at)))
+
+    efm = _efm_to_ingest(telemetry, received_at)
+    if efm is not None:
+        messages.append((EFM, efm))
+
+    if telemetry.HasField("geiger"):
+        messages.append((GEIGER, {
+            "time": _utc_iso(received_at),
+            "hits_in_interval": telemetry.geiger.hits_in_interval,
+        }))
+
+    if not messages:
+        raise ValueError("Telemetry packet carries no purple, beacon, efm or geiger data")
+    return messages
+
+
+def decode_protobuf_packet(data: bytes, received_at: datetime | None = None) -> tuple[str, dict]:
+    """First message of a packet (kept for callers that expect one result per packet)."""
+    return decode_protobuf_messages(data, received_at)[0]
 
 
 def decode_radio_frame(frame: bytes, received_at: datetime | None = None) -> tuple[str, dict]:
@@ -167,6 +201,13 @@ def decode_radio_frame(frame: bytes, received_at: datetime | None = None) -> tup
     if frame[:1] == bytes((SYNC_BYTE,)):
         return decode_rf_frame_to_ingest_payload(frame)
     return decode_protobuf_packet(frame, received_at)
+
+
+def decode_radio_messages(frame: bytes, received_at: datetime | None = None) -> list[tuple[str, dict]]:
+    """Like ``decode_radio_frame`` but returns every message the frame carries."""
+    if frame[:1] == bytes((SYNC_BYTE,)):
+        return [decode_rf_frame_to_ingest_payload(frame)]
+    return decode_protobuf_messages(frame, received_at)
 
 
 def decode_radio_hex(frame_hex: str, received_at: datetime | None = None) -> tuple[str, dict]:

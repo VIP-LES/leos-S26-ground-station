@@ -92,6 +92,14 @@ def ensure_schema():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS geiger_data (
+                time              timestamptz PRIMARY KEY,
+                hits_in_interval  bigint
+            )
+            """
+        )
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS gps_utc timestamptz")
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS humidity double precision")
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS altitude double precision")
@@ -123,12 +131,22 @@ def ensure_schema():
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc1_ch4_breakbeam double precision")
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc2_ch1_diff double precision")
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc2_ch4_breakbeam double precision")
+        # Interval summaries from the two field mills (efm0 / efm1).
+        for n in (0, 1):
+            cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_avg_sample double precision")
+            cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_min_sample double precision")
+            cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_max_sample double precision")
+            cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_hall_events bigint")
         cur.execute(
             "SELECT create_hypertable('sensors_and_gps_data', 'time', "
             "if_not_exists => TRUE, migrate_data => TRUE)"
         )
         cur.execute(
             "SELECT create_hypertable('efm_data', 'time', "
+            "if_not_exists => TRUE, migrate_data => TRUE)"
+        )
+        cur.execute(
+            "SELECT create_hypertable('geiger_data', 'time', "
             "if_not_exists => TRUE, migrate_data => TRUE)"
         )
     logger.info("Schema ensured")
@@ -197,22 +215,22 @@ def insert_sensors_and_gps_row(row: dict) -> bool:
     return inserted
 
 
+_EFM_COLUMNS = (
+    "adc1_ch1_diff", "adc1_ch4_breakbeam", "adc2_ch1_diff", "adc2_ch4_breakbeam",
+    "efm0_avg_sample", "efm0_min_sample", "efm0_max_sample", "efm0_hall_events",
+    "efm1_avg_sample", "efm1_min_sample", "efm1_max_sample", "efm1_hall_events",
+)
+
+
 def insert_efm_row(row: dict) -> bool:
-    """Insert one EFM row."""
-    sql = """
-        INSERT INTO efm_data
-            (time, adc1_ch1_diff, adc1_ch4_breakbeam,
-             adc2_ch1_diff, adc2_ch4_breakbeam)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (time) DO NOTHING
-    """
-    values = (
-        row["time"],
-        row.get("adc1_ch1_diff"),
-        row.get("adc1_ch4_breakbeam"),
-        row.get("adc2_ch1_diff"),
-        row.get("adc2_ch4_breakbeam"),
+    """Insert one EFM row (raw ADC samples and/or efm0/efm1 interval summaries)."""
+    columns = ("time",) + _EFM_COLUMNS
+    sql = (
+        f"INSERT INTO efm_data ({', '.join(columns)}) "
+        f"VALUES ({', '.join(['%s'] * len(columns))}) "
+        "ON CONFLICT (time) DO NOTHING"
     )
+    values = (row["time"],) + tuple(row.get(c) for c in _EFM_COLUMNS)
     conn = _get_conn()
     with conn.cursor() as cur:
         cur.execute(sql, values)
@@ -222,6 +240,26 @@ def insert_efm_row(row: dict) -> bool:
         logger.info("Inserted EFM row at time %s", row["time"])
     else:
         logger.debug("Duplicate EFM row at time %s, skipped", row["time"])
+    return inserted
+
+
+def insert_geiger_row(row: dict) -> bool:
+    """Insert one geiger counter row."""
+    sql = """
+        INSERT INTO geiger_data (time, hits_in_interval)
+        VALUES (%s, %s)
+        ON CONFLICT (time) DO NOTHING
+    """
+    values = (row["time"], row.get("hits_in_interval"))
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, values)
+        inserted = cur.rowcount > 0
+
+    if inserted:
+        logger.info("Inserted geiger row at time %s", row["time"])
+    else:
+        logger.debug("Duplicate geiger row at time %s, skipped", row["time"])
     return inserted
 
 

@@ -7,6 +7,9 @@ RADIO_ARGS="--sf 9 --freq 915000000".
 Loss detection: LoRa has no acknowledgements, so a packet that never arrives is invisible to the
 radio. Every protobuf Packet carries a sequence number, so a jump in that number (seq 7 then 10)
 means packets 8 and 9 were missed. Those gaps are logged and counted in the periodic stats line.
+
+One radio packet can carry several kinds of telemetry (sensors, EFM, geiger), so each decoded
+packet is queued as one row per kind.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import time
 from datetime import datetime, timezone
 
 from src import queue_writer
-from src.protobuf_decoder import decode_radio_frame, parse_packet
+from src.protobuf_decoder import decode_radio_messages, parse_packet
 
 logger = logging.getLogger(__name__)
 
@@ -84,18 +87,21 @@ def run_python_radio(
             else:
                 frame = bytes.fromhex(pkt["hex"])
                 try:
-                    message_type, payload = decode_radio_frame(frame, datetime.now(timezone.utc))
+                    messages = decode_radio_messages(frame, datetime.now(timezone.utc))
                 except Exception as exc:
                     logger.warning("Decode failed (%s) len=%d data=%s", exc, len(frame), frame.hex())
                 else:
                     stats["decoded"] += 1
-                    queue_writer.enqueue(queue_path, message_type, payload)
-                    stats["queued"] += 1
+                    for message_type, payload in messages:
+                        queue_writer.enqueue(queue_path, message_type, payload)
+                        stats["queued"] += 1
 
                     callsign, sequence = _packet_identity(frame)
                     who = f"{callsign} seq={sequence}" if callsign is not None else "legacy frame"
                     logger.info(
-                        "Queued %s from %s (rssi=%s snr=%s)", message_type, who, pkt.get("rssi"), pkt.get("snr")
+                        "Queued %s from %s (rssi=%s snr=%s)",
+                        "+".join(message_type for message_type, _ in messages),
+                        who, pkt.get("rssi"), pkt.get("snr"),
                     )
                     if callsign is not None:
                         _track_sequence(last_seq, stats, callsign, sequence)
