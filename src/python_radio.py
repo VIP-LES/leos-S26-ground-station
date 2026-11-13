@@ -10,16 +10,22 @@ means packets 8 and 9 were missed. Those gaps are logged and counted in the peri
 
 One radio packet can carry several kinds of telemetry (sensors, EFM, geiger), so each decoded
 packet is queued as one row per kind.
+
+Uplink: this process owns the radio, so commands are transmitted from here. send_cutdown.py drops
+a request file into TX_SPOOL_DIR; the loop below picks it up between received packets, checks it,
+transmits it, and writes a result file. Transmitting is OFF unless RADIO_TX_ENABLED=true.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src import queue_writer
 from src.protobuf_decoder import decode_radio_messages, parse_packet
@@ -28,6 +34,78 @@ logger = logging.getLogger(__name__)
 
 POLL_SLEEP_S = 0.002
 STATS_INTERVAL_S = 10.0
+TX_CHECK_S = 0.2
+DEFAULT_TX_POWER_DBM = 10
+
+
+def tx_spool_dir() -> Path:
+    return Path(os.environ.get("TX_SPOOL_DIR") or "~/leos-state/tx").expanduser()
+
+
+def _write_result(tx_dir: Path, request_id: str, status: str, detail: str = "") -> None:
+    """Write <id>.result.json atomically so send_cutdown.py never reads a half-written file."""
+    result = {"status": status, "detail": detail, "t": time.time()}
+    tmp = tx_dir / f"{request_id}.result.tmp"
+    tmp.write_text(json.dumps(result))
+    os.replace(tmp, tx_dir / f"{request_id}.result.json")
+
+
+def service_tx_requests(radio, tx_dir: Path, stats: dict) -> None:
+    """Handle at most one pending transmit request. Every outcome is written to a result file.
+
+    A request is sent only if ALL of these hold: RADIO_TX_ENABLED=true, it has not expired, and
+    the bytes are a LEOS command packet. Anything else is refused, so a stale or malformed file
+    can never cause a transmission.
+    """
+    try:
+        requests_pending = sorted(tx_dir.glob("*.request.json"))
+    except OSError:
+        return
+    if not requests_pending:
+        return
+
+    path = requests_pending[0]
+    request_id = path.name[: -len(".request.json")]
+    try:
+        request = json.loads(path.read_text())
+        data = bytes.fromhex(request["hex"])
+        expires_at = float(request["expires_at"])
+    except Exception as exc:
+        _write_result(tx_dir, request_id, "rejected", f"unreadable request: {exc}")
+        path.unlink(missing_ok=True)
+        return
+
+    path.unlink(missing_ok=True)   # consumed: it can never be sent twice
+
+    if os.environ.get("RADIO_TX_ENABLED", "").strip().lower() != "true":
+        status, detail = "rejected", "transmitting is disabled (set RADIO_TX_ENABLED=true)"
+    elif time.time() > expires_at:
+        status, detail = "expired", "request was too old, not sent"
+    else:
+        try:
+            packet = parse_packet(data)
+            is_command = packet.WhichOneof("payload") == "command"
+        except Exception as exc:
+            is_command, detail = False, f"not a LEOS packet: {exc}"
+        else:
+            detail = "only command packets can be transmitted"
+        if not is_command:
+            status = "rejected"
+        else:
+            from radio.radio_tx import TransmitError, transmit
+
+            power = int(os.environ.get("RADIO_TX_POWER_DBM", DEFAULT_TX_POWER_DBM))
+            try:
+                transmit(radio, data, power_dbm=power)
+            except TransmitError as exc:
+                status, detail = "failed", str(exc)
+            else:
+                status, detail = "sent", f"{len(data)} bytes at {power} dBm"
+                stats["tx_sent"] = stats.get("tx_sent", 0) + 1
+
+    log = logger.warning if status == "sent" else logger.error
+    log("Uplink request %s: %s (%s)", request_id, status, detail)
+    _write_result(tx_dir, request_id, status, detail)
 
 
 def _open_radio():
@@ -74,10 +152,16 @@ def run_python_radio(
     stats = {"received": 0, "decoded": 0, "queued": 0, "bad_crc": 0, "missed": 0, "restarts": 0, "duplicates": 0}
     last_seq: dict[str, int] = {}
     last_stats = time.monotonic()
+    last_tx_check = 0.0
+    tx_dir = tx_spool_dir()
+    tx_dir.mkdir(parents=True, exist_ok=True)
 
     while not stop.is_set():
         pkt = radio.poll()
         if pkt is None:
+            if time.monotonic() - last_tx_check >= TX_CHECK_S:
+                last_tx_check = time.monotonic()
+                service_tx_requests(radio, tx_dir, stats)
             time.sleep(POLL_SLEEP_S)
         else:
             stats["received"] += 1
