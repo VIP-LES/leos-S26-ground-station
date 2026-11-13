@@ -12,12 +12,12 @@ from src import queue_writer
 from src.models import INGEST_PATHS
 
 logger = logging.getLogger(__name__)
-
+_session = requests.Session() 
 
 def _post_row(message_type: str, payload: dict, ingest_url: str) -> str:
     endpoint = INGEST_PATHS[message_type]
     try:
-        resp = requests.post(f"{ingest_url.rstrip('/')}{endpoint}", json=payload, timeout=5)
+        resp = _session.post(f"{ingest_url.rstrip('/')}{endpoint}", json=payload, timeout=5)
     except requests.RequestException as exc:
         logger.error("Forwarder POST failed: %s", exc)
         return "retry"
