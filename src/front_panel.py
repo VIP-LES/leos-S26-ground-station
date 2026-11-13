@@ -13,6 +13,7 @@ Releasing early, or letting the 10 s run out, disarms it again.
 LEDs:
     green, brief flash every 2 s    the receiver is running and hearing the payload (last 15 s)
     (nothing)                       not hearing the payload, or the receiver is not running
+    red and yellow taking turns     the radio is not working (cannot open or failed); the button will not fire
     red, slow blink                 configuration problem (no key file or no callsign): the button will not fire
     yellow solid                    button held, arming
     yellow, fast flash              ARMED, release and press again to fire
@@ -103,12 +104,15 @@ class ButtonLogic:
         self._until = now + self.result_s
 
 
-def led_levels(state: str, now: float, link_ok: bool, config_ok: bool) -> dict[str, bool]:
+def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True) -> dict[str, bool]:
     """Which LEDs are on, for a given state and time."""
     fast = int(now * 5) % 2 == 0          # about 2.5 flashes a second
     leds = {"red": False, "yellow": False, "green": False}
     if state in ("wait_release", "idle", "lockout"):
-        if not config_ok:
+        if not radio_ok:
+            alternate = (now % 2.0) < 1.0           # red and yellow take turns: the radio is not working
+            leds["red"], leds["yellow"] = alternate, not alternate
+        elif not config_ok:
             leds["red"] = (now % 2.0) < 1.0
         elif link_ok:
             leds["green"] = (now % 2.0) < 0.1
@@ -228,6 +232,10 @@ class FrontPanel:
             logger.warning("FRONT PANEL PRACTICE: the cutdown would be sent now (nothing is transmitted)")
             self._pending = ("practice", None, None, now + 1.5)
             return
+        if not self.status.get("radio_ok", True):
+            logger.error("FRONT PANEL: cutdown NOT sent: the radio is not working")
+            self.logic.finish(now, False)
+            return
         try:
             key, callsign = load_cutdown_config()
             data = cutdown_command.build_cutdown_packet(authorization_key=key, callsign=callsign)
@@ -269,7 +277,8 @@ class FrontPanel:
         if self.logic.state != self._last_state:
             logger.info("Front panel: %s", self.logic.state)
             self._last_state = self.logic.state
-        leds = led_levels(self.logic.state, now, self.link_ok(now), self.config_ok)
+        leds = led_levels(self.logic.state, now, self.link_ok(now), self.config_ok,
+                          self.status.get("radio_ok", True))
         if leds != self._last_leds:
             self.gpio.write_leds(leds)
             self._last_leds = leds

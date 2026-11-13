@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 POLL_SLEEP_S = 0.002
 STATS_INTERVAL_S = 10.0
 TX_CHECK_S = 0.2
+OPEN_RETRY_S = 5.0
 DEFAULT_TX_POWER_DBM = 10
 
 
@@ -135,39 +136,25 @@ def _packet_identity(frame: bytes) -> tuple[str | None, int | None]:
     return packet.callsign, packet.sequence
 
 
-def run_python_radio(
-    queue_path: str,
-    *,
-    radio=None,
-    stop: threading.Event | None = None,
-) -> dict:
-    """Poll the radio forever, decode each packet, and enqueue it for the forwarder.
-
-    ``radio`` (anything with ``poll() -> dict | None``) and ``stop`` exist so tests can drive the
-    loop without hardware. Returns the final counters when ``stop`` is set.
-    """
-    stop = stop or threading.Event()
+def _close_radio(radio) -> None:
+    """Release the pins and SPI port of a real SX1262 so a fresh one can claim them again."""
     try:
-        radio = radio or _open_radio()
-    except Exception:
-        logger.exception("Could not start the SX1262 radio")
-        raise
+        import lgpio
 
-    stats = {"received": 0, "decoded": 0, "queued": 0, "bad_crc": 0, "missed": 0, "restarts": 0, "duplicates": 0}
-    last_seq: dict[str, int] = {}
+        spi = getattr(radio, "spi", None)
+        if spi is not None:
+            spi.close()
+        handle = getattr(radio, "h", None)
+        if handle is not None:
+            lgpio.gpiochip_close(handle)
+    except Exception:
+        pass   # best effort: a radio that is already broken may fail to close
+
+
+def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir) -> None:
+    """Poll the radio until ``stop`` is set (or until the radio raises)."""
     last_stats = time.monotonic()
     last_tx_check = 0.0
-    tx_dir = tx_spool_dir()
-    tx_dir.mkdir(parents=True, exist_ok=True)
-
-    status = {"last_rx": None}          # read by the front panel for the "hearing the payload" LED
-    try:
-        from src.front_panel import start_front_panel
-
-        start_front_panel(stop, status)
-    except Exception:
-        logger.exception("Front panel did not start; the receiver carries on without it")
-
     while not stop.is_set():
         pkt = radio.poll()
         if pkt is None:
@@ -211,6 +198,65 @@ def run_python_radio(
                 stats["missed"], stats["restarts"], stats["duplicates"],
             )
             last_stats = now
+
+
+def run_python_radio(
+    queue_path: str,
+    *,
+    radio=None,
+    stop: threading.Event | None = None,
+) -> dict:
+    """Receive forever, decode each packet, and enqueue it for the forwarder.
+
+    This never gives up. If the radio cannot be opened (for example another program holds its GPIO
+    pins) or fails while running, it logs the problem, releases the pins, waits, and tries again, so
+    the front panel keeps its LEDs and the receiver recovers by itself once the cause is gone.
+
+    ``radio`` (anything with ``poll() -> dict | None``) and ``stop`` exist so tests can drive the
+    loop without hardware: a radio passed in is used as is and is never reopened. Returns the final
+    counters when ``stop`` is set.
+    """
+    stop = stop or threading.Event()
+    stats = {"received": 0, "decoded": 0, "queued": 0, "bad_crc": 0, "missed": 0, "restarts": 0,
+             "duplicates": 0, "radio_reopened": 0}
+    last_seq: dict[str, int] = {}
+    tx_dir = tx_spool_dir()
+    tx_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read by the front panel: "hearing the payload" LED and the "radio is down" warning.
+    status = {"last_rx": None, "radio_ok": False}
+    # Started BEFORE the radio, so the LEDs work (and show a radio fault) even if the radio cannot open.
+    try:
+        from src.front_panel import start_front_panel
+
+        start_front_panel(stop, status)
+    except Exception:
+        logger.exception("Front panel did not start; the receiver carries on without it")
+
+    injected = radio is not None
+    while not stop.is_set():
+        try:
+            current = radio if injected else _open_radio()
+        except Exception:
+            status["radio_ok"] = False
+            logger.exception("Could not start the SX1262 radio; trying again in %.0f s", OPEN_RETRY_S)
+            stop.wait(OPEN_RETRY_S)
+            continue
+
+        status["radio_ok"] = True
+        try:
+            _receive_loop(current, queue_path, stop, stats, last_seq, status, tx_dir)
+        except Exception:
+            status["radio_ok"] = False
+            logger.exception("The radio loop failed; reopening the radio in %.0f s", OPEN_RETRY_S)
+            if injected:
+                break
+            _close_radio(current)
+            stats["radio_reopened"] += 1
+            stop.wait(OPEN_RETRY_S)
+        else:
+            if not injected:
+                _close_radio(current)
     return stats
 
 
