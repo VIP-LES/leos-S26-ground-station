@@ -14,9 +14,11 @@ command IS the request to cut down, so the radio must check the key before actin
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 CALLSIGN_MAX = 16  # packet.options: callsign max_size 17 including the terminating NUL
@@ -43,14 +45,72 @@ def _load_packet_module():
     return packet_pb2
 
 
-def new_sequence() -> int:
-    """A sequence number that always increases between runs: whole seconds since the Unix epoch.
+def tx_spool_dir() -> Path:
+    """Folder where requests for the receiver to transmit are dropped."""
+    return Path(os.environ.get("TX_SPOOL_DIR") or "~/leos-state/tx").expanduser()
 
-    The radio should accept a command only if its sequence is higher than the last one it
-    accepted from this callsign, so a recorded packet cannot simply be replayed. Fits in
-    uint32 until the year 2106.
+
+def _sequence_file() -> Path:
+    return Path(os.environ.get("CUTDOWN_SEQ_FILE") or "~/leos-state/cutdown_seq").expanduser()
+
+
+def new_sequence(state_file: Path | None = None) -> int:
+    """A sequence number that always increases, even if the clock goes backwards.
+
+    The Pi has no battery-backed clock, so with no network its time can restart from an old
+    value after a reboot. The sequence is therefore max(Unix time, last used + 1), and the last
+    value is kept in a small file. A receiver that rejects old sequences can then never see a
+    new command look older than the previous one.
     """
-    return int(time.time())
+    path = state_file or _sequence_file()
+    last = 0
+    try:
+        last = int(path.read_text().strip())
+    except (OSError, ValueError):
+        pass
+    sequence = max(int(time.time()), last + 1)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(str(sequence))
+        os.replace(tmp, path)
+    except OSError:
+        pass   # never block a cutdown because the counter file could not be written
+    return sequence
+
+
+def write_request(data: bytes, tx_dir: Path, expires_s: float) -> tuple[str, Path]:
+    """Queue a packet for the receiver to transmit. Returns (request id, request file path)."""
+    tx_dir.mkdir(parents=True, exist_ok=True)
+    request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    tmp = tx_dir / f"{request_id}.tmp"
+    tmp.write_text(json.dumps({"hex": data.hex(), "expires_at": time.time() + expires_s}))
+    final = tx_dir / f"{request_id}.request.json"
+    os.replace(tmp, final)   # atomic: the receiver never sees a half-written request
+    return request_id, final
+
+
+def check_result(tx_dir: Path, request_id: str) -> dict | None:
+    """The receiver's answer for a request, or None if it has not answered yet."""
+    result_path = tx_dir / f"{request_id}.result.json"
+    if not result_path.exists():
+        return None
+    try:
+        result = json.loads(result_path.read_text())
+    except (OSError, ValueError):
+        return None   # caught mid-write; try again on the next call
+    result_path.unlink(missing_ok=True)
+    return result
+
+
+def wait_for_result(tx_dir: Path, request_id: str, wait_s: float) -> dict | None:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        result = check_result(tx_dir, request_id)
+        if result is not None:
+            return result
+        time.sleep(0.2)
+    return None
 
 
 def build_cutdown_packet(*, authorization_key: int, callsign: str, sequence: int | None = None) -> bytes:

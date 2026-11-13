@@ -11,6 +11,10 @@ means packets 8 and 9 were missed. Those gaps are logged and counted in the peri
 One radio packet can carry several kinds of telemetry (sensors, EFM, geiger), so each decoded
 packet is queued as one row per kind.
 
+Front panel: with FRONT_PANEL_ENABLED=true, a button and LEDs on the Pi (see src/front_panel.py) let
+you send the cutdown locally with no network at all. It only queues a request; the transmit below
+does the sending.
+
 Uplink: this process owns the radio, so commands are transmitted from here. send_cutdown.py drops
 a request file into TX_SPOOL_DIR; the loop below picks it up between received packets, checks it,
 transmits it, and writes a result file. Transmitting is OFF unless RADIO_TX_ENABLED=true.
@@ -156,6 +160,14 @@ def run_python_radio(
     tx_dir = tx_spool_dir()
     tx_dir.mkdir(parents=True, exist_ok=True)
 
+    status = {"last_rx": None}          # read by the front panel for the "hearing the payload" LED
+    try:
+        from src.front_panel import start_front_panel
+
+        start_front_panel(stop, status)
+    except Exception:
+        logger.exception("Front panel did not start; the receiver carries on without it")
+
     while not stop.is_set():
         pkt = radio.poll()
         if pkt is None:
@@ -175,6 +187,7 @@ def run_python_radio(
                 except Exception as exc:
                     logger.warning("Decode failed (%s) len=%d data=%s", exc, len(frame), frame.hex())
                 else:
+                    status["last_rx"] = time.monotonic()
                     stats["decoded"] += 1
                     for message_type, payload in messages:
                         queue_writer.enqueue(queue_path, message_type, payload)

@@ -16,20 +16,12 @@ shell history or in `ps` output.
 
 import argparse
 import getpass
-import json
 import os
 import sys
-import time
-import uuid
-from pathlib import Path
 
 import cutdown_command
 
 CONFIRM_WORD = "CUTDOWN"
-
-
-def tx_spool_dir() -> Path:
-    return Path(os.environ.get("TX_SPOOL_DIR") or "~/leos-state/tx").expanduser()
 
 
 def read_key() -> int:
@@ -38,29 +30,6 @@ def read_key() -> int:
         return int(raw.strip(), 0)
     except ValueError:
         sys.exit("The authorization key must be a number (decimal or 0x hex).")
-
-
-def write_request(data: bytes, tx_dir: Path, expires_s: float) -> tuple[str, Path]:
-    """Queue a packet for the receiver to transmit. Returns (request id, request file path)."""
-    tx_dir.mkdir(parents=True, exist_ok=True)
-    request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    tmp = tx_dir / f"{request_id}.tmp"
-    tmp.write_text(json.dumps({"hex": data.hex(), "expires_at": time.time() + expires_s}))
-    final = tx_dir / f"{request_id}.request.json"
-    os.replace(tmp, final)   # atomic: the receiver never sees a half-written request
-    return request_id, final
-
-
-def wait_for_result(tx_dir: Path, request_id: str, wait_s: float) -> dict | None:
-    result_path = tx_dir / f"{request_id}.result.json"
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if result_path.exists():
-            result = json.loads(result_path.read_text())
-            result_path.unlink(missing_ok=True)
-            return result
-        time.sleep(0.2)
-    return None
 
 
 def main() -> None:
@@ -82,10 +51,10 @@ def main() -> None:
     if input(f"Type {CONFIRM_WORD} to send, anything else to cancel: ").strip() != CONFIRM_WORD:
         sys.exit("Cancelled. Nothing was sent.")
 
-    tx_dir = tx_spool_dir()
-    request_id, request_path = write_request(data, tx_dir, args.expires)
+    tx_dir = cutdown_command.tx_spool_dir()
+    request_id, request_path = cutdown_command.write_request(data, tx_dir, args.expires)
     print(f"Request {request_id} queued, waiting for the receiver to transmit it...")
-    result = wait_for_result(tx_dir, request_id, args.expires + 5)
+    result = cutdown_command.wait_for_result(tx_dir, request_id, args.expires + 5)
     if result is None:
         request_path.unlink(missing_ok=True)    # make sure it cannot be sent after we give up
         sys.exit("No answer from the receiver. The request was withdrawn and nothing was sent.\n"
