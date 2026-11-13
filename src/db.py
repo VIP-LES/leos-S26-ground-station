@@ -131,7 +131,10 @@ def ensure_schema():
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc1_ch4_breakbeam double precision")
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc2_ch1_diff double precision")
         cur.execute("ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS adc2_ch4_breakbeam double precision")
-        # Interval summaries from the two field mills (efm0 / efm1).
+        # Motor frequency from the two field mills (efm0 / efm1).
+        for n in (0, 1):
+            cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_motor_frequency double precision")
+        # Older interval summaries (avg / min / max / hall events), kept for existing rows.
         for n in (0, 1):
             cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_avg_sample double precision")
             cur.execute(f"ALTER TABLE efm_data ADD COLUMN IF NOT EXISTS efm{n}_min_sample double precision")
@@ -219,11 +222,12 @@ _EFM_COLUMNS = (
     "adc1_ch1_diff", "adc1_ch4_breakbeam", "adc2_ch1_diff", "adc2_ch4_breakbeam",
     "efm0_avg_sample", "efm0_min_sample", "efm0_max_sample", "efm0_hall_events",
     "efm1_avg_sample", "efm1_min_sample", "efm1_max_sample", "efm1_hall_events",
+    "efm0_motor_frequency", "efm1_motor_frequency",
 )
 
 
 def insert_efm_row(row: dict) -> bool:
-    """Insert one EFM row (raw ADC samples and/or efm0/efm1 interval summaries)."""
+    """Insert one EFM row (motor frequencies, or the older ADC / summary formats)."""
     columns = ("time",) + _EFM_COLUMNS
     sql = (
         f"INSERT INTO efm_data ({', '.join(columns)}) "

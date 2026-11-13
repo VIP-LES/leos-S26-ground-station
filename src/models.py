@@ -52,8 +52,9 @@ class SensorsAndGpsPayload(BaseModel):
 class EfmPayload(BaseModel):
     """Structured EFM telemetry payload.
 
-    The adc* fields are the older raw-sample format. The efm0_* / efm1_* fields are the
-    interval summaries (avg/min/max sample and hall events) from the two field mills.
+    efm0_motor_frequency / efm1_motor_frequency are the current format (one motor frequency per
+    field mill). The adc* and avg/min/max/hall fields are older formats, kept so rows queued
+    before the change are still accepted.
     """
 
     time: str
@@ -61,6 +62,8 @@ class EfmPayload(BaseModel):
     adc1_ch4_breakbeam: float | None = None
     adc2_ch1_diff: float | None = None
     adc2_ch4_breakbeam: float | None = None
+    efm0_motor_frequency: float | None = None
+    efm1_motor_frequency: float | None = None
     efm0_avg_sample: float | None = None
     efm0_min_sample: float | None = None
     efm0_max_sample: float | None = None

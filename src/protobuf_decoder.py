@@ -9,7 +9,7 @@ Schema (current): Packet.telemetry is a TelemetryPacket with optional sub-messag
 ``purple`` (PurpleboardData, including ``air``), ``beacon`` (GPS + health), ``efm0``/``efm1``
 (interval summaries) and ``geiger``. One packet can carry several of these, so decoding returns a
 list of ``(message_type, payload)`` pairs: ``purple`` + ``beacon`` become ``sensors_and_gps``,
-``efm0`` / ``efm1`` become one ``efm`` row, and ``geiger`` becomes a ``geiger`` row.
+``efm0`` / ``efm1`` (motor frequency) become one ``efm`` row, and ``geiger`` becomes a ``geiger`` row.
 
 Setup: clone leos-protobufs (branch ``luke``) next to this repo, or point LEOS_PROTOBUF_PATH at it.
 The generated Python modules need ``protobuf>=7.35.1`` (they check the runtime version on import).
@@ -138,16 +138,12 @@ def _telemetry_to_ingest(telemetry, received_at: datetime) -> dict:
 
 
 def _efm_to_ingest(telemetry, received_at: datetime) -> dict | None:
-    """efm0 / efm1 interval summaries -> one efm row. None if neither is present."""
+    """efm0 / efm1 (each just a motor frequency) -> one efm row. None if neither is present."""
     payload: dict = {"time": _utc_iso(received_at)}
     found = False
     for n, name in ((0, "efm0"), (1, "efm1")):
         if telemetry.HasField(name):
-            e = getattr(telemetry, name)
-            payload[f"efm{n}_avg_sample"] = e.avg_sample
-            payload[f"efm{n}_min_sample"] = e.min_sample
-            payload[f"efm{n}_max_sample"] = e.max_sample
-            payload[f"efm{n}_hall_events"] = e.hall_events_in_interval
+            payload[f"efm{n}_motor_frequency"] = getattr(telemetry, name).motor_frequency
             found = True
     return payload if found else None
 
