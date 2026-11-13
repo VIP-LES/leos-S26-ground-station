@@ -1,0 +1,16 @@
+[Unit]
+Description=LEOS ground station: radio receiver, cutdown uplink and front panel (Pi mode)
+# No network dependency, so it starts with no hotspot.
+# No After=multi-user.target either: that target pulls this unit in, so ordering after it would create a cycle.
+
+[Service]
+Type=simple
+User=leos-groundstation
+WorkingDirectory=/home/leos-groundstation/leos-S26-ground-station
+ExecStart=/home/leos-groundstation/leos-S26-ground-station/venv/bin/python3 index.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
