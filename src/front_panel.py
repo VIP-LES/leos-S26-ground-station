@@ -1,8 +1,11 @@
 """Front panel for the ground station: a physical button that sends the cutdown, and LEDs that show status.
 
 Runs inside the receiver process (index.py), on the Pi itself, with no network, no SSH and no
-hotspot. Pins come from the ground-station schematic (BCM numbers):
-    nBTN -> GPIO12 (pressed = low)    RED_LED -> GPIO16    YELLOW_LED -> GPIO20    GREEN_LED -> GPIO21
+hotspot. Pins (BCM numbers), as found on this board by testing:
+    button nBTN -> GPIO12 (pressed = low)
+    red LED     -> GPIO16
+    green LED   -> GPIO20   (the schematic calls this net YELLOW_LED, but the part on it is green)
+    GPIO21 (schematic GREEN_LED) shows nothing on this board, so it is NOT used: two-LED mode is the default.
 
 How to fire (three deliberate steps, so a bump or a pocket press does nothing):
     1. HOLD the button for 3 s              -> yellow turns solid, then keeps flashing: ARMED
@@ -21,6 +24,10 @@ LEDs:
     red solid                       transmitting
     red + yellow + green, all on    TRANSMITTED (10 s). The radio gets no reply, so this means "sent", not "payload cut down"
     red, fast flash (10 s)          the send failed
+
+With only red and green (the default here), everything "yellow" does above is shown on GREEN instead:
+green solid = holding, green fast flash = armed, red and green taking turns = radio fault, red + green on =
+transmitted. If a working third LED is fitted later: FRONT_PANEL_TWO_LEDS=false, FRONT_PANEL_YELLOW_PIN=<its pin>.
 
 Needs FRONT_PANEL_ENABLED=true, RADIO_TX_ENABLED=true, GROUND_CALLSIGN, and a key file (CUTDOWN_KEY_FILE,
 default ~/leos-state/cutdown_key, readable only by this user). Bring-up on the real hardware:
@@ -104,8 +111,9 @@ class ButtonLogic:
         self._until = now + self.result_s
 
 
-def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True) -> dict[str, bool]:
-    """Which LEDs are on, for a given state and time."""
+def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True,
+               two_leds: bool = False) -> dict[str, bool]:
+    """Which LEDs are on, for a given state and time. With two_leds, yellow is shown on green instead."""
     fast = int(now * 5) % 2 == 0          # about 2.5 flashes a second
     leds = {"red": False, "yellow": False, "green": False}
     if state in ("wait_release", "idle", "lockout"):
@@ -128,21 +136,26 @@ def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok:
         leds = {"red": True, "yellow": True, "green": True}
     elif state == "result_fail":
         leds["red"] = fast
+    if two_leds:
+        leds["green"] = leds["green"] or leds["yellow"]
+        leds["yellow"] = False
     return leds
 
 
 class LgpioPins:
     """The real pins, through lgpio (the same library the radio uses)."""
 
-    def __init__(self, pins: dict[str, int], *, led_active_low: bool = False, button_active_low: bool = True):
+    def __init__(self, pins: dict[str, int], *, led_active_low: bool = False, button_active_low: bool = True,
+                 two_leds: bool = False):
         import lgpio
 
-        self.lgpio, self.pins = lgpio, pins
+        self.lgpio, self.pins, self.two_leds = lgpio, pins, two_leds
+        self.led_names = ("red", "green") if two_leds else ("red", "yellow", "green")
         self.led_active_low, self.button_active_low = led_active_low, button_active_low
         self.h = lgpio.gpiochip_open(0)
         pull = lgpio.SET_PULL_UP if button_active_low else lgpio.SET_PULL_DOWN
         lgpio.gpio_claim_input(self.h, pins["button"], pull)
-        for name in ("red", "yellow", "green"):
+        for name in self.led_names:
             lgpio.gpio_claim_output(self.h, pins[name], self._level(False))
 
     def _level(self, on: bool) -> int:
@@ -154,7 +167,8 @@ class LgpioPins:
 
     def write_leds(self, levels: dict[str, bool]) -> None:
         for name, on in levels.items():
-            self.lgpio.gpio_write(self.h, self.pins[name], self._level(on))
+            if name in self.led_names:
+                self.lgpio.gpio_write(self.h, self.pins[name], self._level(on))
 
     def close(self) -> None:
         try:
@@ -193,8 +207,9 @@ def load_cutdown_config() -> tuple[int, str]:
 
 class FrontPanel:
     def __init__(self, gpio, status: dict, *, practice: bool = False, expires_s: float = 30.0,
-                 logic: ButtonLogic | None = None):
+                 logic: ButtonLogic | None = None, two_leds: bool | None = None):
         self.gpio, self.status, self.practice, self.expires_s = gpio, status, practice, expires_s
+        self.two_leds = _two_leds_from_env() if two_leds is None else two_leds
         self.logic = logic or ButtonLogic()
         self._pending = None            # (request id, spool dir, request path, give-up time)
         self._raw, self._raw_since, self._stable = False, 0.0, False
@@ -278,7 +293,7 @@ class FrontPanel:
             logger.info("Front panel: %s", self.logic.state)
             self._last_state = self.logic.state
         leds = led_levels(self.logic.state, now, self.link_ok(now), self.config_ok,
-                          self.status.get("radio_ok", True))
+                          self.status.get("radio_ok", True), self.two_leds)
         if leds != self._last_leds:
             self.gpio.write_leds(leds)
             self._last_leds = leds
@@ -305,12 +320,17 @@ class FrontPanel:
 def _pins_from_env() -> dict[str, int]:
     return {"button": int(os.environ.get("FRONT_PANEL_BTN_PIN", 12)),
             "red": int(os.environ.get("FRONT_PANEL_RED_PIN", 16)),
-            "yellow": int(os.environ.get("FRONT_PANEL_YELLOW_PIN", 20)),
-            "green": int(os.environ.get("FRONT_PANEL_GREEN_PIN", 21))}
+            "yellow": int(os.environ.get("FRONT_PANEL_YELLOW_PIN", 21)),   # not used in two-LED mode
+            "green": int(os.environ.get("FRONT_PANEL_GREEN_PIN", 20))}
+
+
+def _two_leds_from_env() -> bool:
+    """Two LEDs (red on GPIO16, green on GPIO20) unless FRONT_PANEL_TWO_LEDS=false."""
+    return os.environ.get("FRONT_PANEL_TWO_LEDS", "true").strip().lower() != "false"
 
 
 def _gpio_from_env() -> LgpioPins:
-    return LgpioPins(_pins_from_env(),
+    return LgpioPins(_pins_from_env(), two_leds=_two_leds_from_env(),
                      led_active_low=os.environ.get("FRONT_PANEL_LED_ACTIVE_LOW", "").lower() == "true",
                      button_active_low=os.environ.get("FRONT_PANEL_BTN_ACTIVE_HIGH", "").lower() != "true")
 
@@ -333,9 +353,9 @@ def _bring_up(mode: str) -> None:
         if mode == "--test":
             print("LED test: red, yellow, green one at a time, then all three. Then 30 s of button readout.")
             for _ in range(2):
-                for name in ("red", "yellow", "green"):
+                for name in gpio.led_names:
                     gpio.write_leds({"red": name == "red", "yellow": name == "yellow", "green": name == "green"})
-                    print(f"  {name} ON")
+                    print(f"  {name} ON (pin {gpio.pins[name]})")
                     time.sleep(1.0)
             gpio.write_leds({"red": True, "yellow": True, "green": True}); print("  all ON"); time.sleep(1.0)
             gpio.write_leds({"red": False, "yellow": False, "green": False})
