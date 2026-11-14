@@ -100,6 +100,17 @@ def ensure_schema():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS radio_link_data (
+                time      timestamptz PRIMARY KEY,
+                rssi      double precision,
+                snr       double precision,
+                callsign  text,
+                sequence  bigint
+            )
+            """
+        )
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS gps_utc timestamptz")
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS humidity double precision")
         cur.execute("ALTER TABLE sensors_and_gps_data ADD COLUMN IF NOT EXISTS altitude double precision")
@@ -150,6 +161,10 @@ def ensure_schema():
         )
         cur.execute(
             "SELECT create_hypertable('geiger_data', 'time', "
+            "if_not_exists => TRUE, migrate_data => TRUE)"
+        )
+        cur.execute(
+            "SELECT create_hypertable('radio_link_data', 'time', "
             "if_not_exists => TRUE, migrate_data => TRUE)"
         )
     logger.info("Schema ensured")
@@ -264,6 +279,26 @@ def insert_geiger_row(row: dict) -> bool:
         logger.info("Inserted geiger row at time %s", row["time"])
     else:
         logger.debug("Duplicate geiger row at time %s, skipped", row["time"])
+    return inserted
+
+
+def insert_radio_link_row(row: dict) -> bool:
+    """Insert the signal strength (RSSI dBm, SNR dB) of one received packet."""
+    sql = """
+        INSERT INTO radio_link_data (time, rssi, snr, callsign, sequence)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (time) DO NOTHING
+    """
+    values = (row["time"], row.get("rssi"), row.get("snr"), row.get("callsign"), row.get("sequence"))
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, values)
+        inserted = cur.rowcount > 0
+
+    if inserted:
+        logger.info("Inserted radio link row at time %s", row["time"])
+    else:
+        logger.debug("Duplicate radio link row at time %s, skipped", row["time"])
     return inserted
 
 

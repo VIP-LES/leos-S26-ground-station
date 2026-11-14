@@ -5,11 +5,13 @@ from pydantic import BaseModel
 SENSORS_AND_GPS = "sensors_and_gps"
 EFM = "efm"
 GEIGER = "geiger"
+RADIO_LINK = "radio_link"
 
 INGEST_PATHS = {
     SENSORS_AND_GPS: "/ingest/sensors-and-gps",
     EFM: "/ingest/efm",
     GEIGER: "/ingest/geiger",
+    RADIO_LINK: "/ingest/radio-link",
 }
 
 
@@ -79,3 +81,13 @@ class GeigerPayload(BaseModel):
 
     time: str
     hits_in_interval: int | None = None
+
+
+class RadioLinkPayload(BaseModel):
+    """Signal quality of one received packet, measured by the ground-station radio."""
+
+    time: str
+    rssi: float | None = None        # dBm
+    snr: float | None = None         # dB
+    callsign: str | None = None
+    sequence: int | None = None

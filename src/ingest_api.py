@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from src import db
-from src.models import EfmPayload, GeigerPayload, SensorsAndGpsPayload
+from src.models import EfmPayload, GeigerPayload, RadioLinkPayload, SensorsAndGpsPayload
 
 logger = logging.getLogger(__name__)
 
@@ -94,3 +94,18 @@ def ingest_geiger(payload: GeigerPayload):
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
     return _result(inserted, payload.time, "geiger")
+
+
+@app.post("/ingest/radio-link")
+def ingest_radio_link(payload: RadioLinkPayload):
+    error = _validate_time(payload.time)
+    if error is not None:
+        return error
+
+    try:
+        inserted = db.insert_radio_link_row(payload.model_dump())
+    except Exception as exc:
+        logger.error("Radio link insert failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    return _result(inserted, payload.time, "radio_link")

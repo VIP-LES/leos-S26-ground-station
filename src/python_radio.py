@@ -222,8 +222,9 @@ def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir, plog
                 if _is_command(frame):
                     entry["hex"] = None            # the raw bytes would contain the cutdown key
                     entry["outcome"] = "command_heard_bytes_not_logged"
+                received_at = datetime.now(timezone.utc)
                 try:
-                    messages = decode_radio_messages(frame, datetime.now(timezone.utc))
+                    messages = decode_radio_messages(frame, received_at)
                 except Exception as exc:
                     entry.setdefault("outcome", f"decode_failed: {exc}")
                     if entry["hex"] is not None:
@@ -238,6 +239,11 @@ def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir, plog
                         stats["queued"] += 1
 
                     callsign, sequence = _packet_identity(frame)
+                    if pkt.get("rssi") is not None or pkt.get("snr") is not None:
+                        queue_writer.enqueue(queue_path, "radio_link", {
+                            "time": received_at.isoformat(), "rssi": pkt.get("rssi"), "snr": pkt.get("snr"),
+                            "callsign": callsign, "sequence": sequence,
+                        })
                     entry.setdefault("outcome", "decoded:" + "+".join(m for m, _ in messages))
                     entry["callsign"], entry["seq"] = callsign, sequence
                     who = f"{callsign} seq={sequence}" if callsign is not None else "legacy frame"
