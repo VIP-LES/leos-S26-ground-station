@@ -70,7 +70,7 @@ def main() -> None:
     if result["status"] != "sent":
         sys.exit(1)
     sequence = cutdown_command.packet_sequence(data)
-    wait_s = args.retry_for + 0.25 if args.retry_for > 0 else args.ack_wait
+    wait_s = args.retry_for + 2 if args.retry_for > 0 else args.ack_wait
     if args.retry_for > 0:
         print(f"Transmitted. Retransmitting about every 2 s until the ACK arrives, for up to {args.retry_for:g} s "
               f"(sequence {sequence})...")

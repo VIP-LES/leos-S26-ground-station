@@ -52,7 +52,7 @@ _recent_tx: dict[int, float] = {}   # sequence -> time.monotonic() of each comma
 # Retransmit-until-ACK (a request with retry_until_ack): the SAME packet is sent again every RETRY_INTERVAL_S
 # (randomised a little, so it never stays in step with the payload's own once-a-second telemetry) until the
 # payload's ACK arrives or CUTDOWN_RETRY_MAX_S runs out, or it is cancelled from the front panel.
-DEFAULT_RETRY_INTERVAL_S = 2.0
+DEFAULT_RETRY_INTERVAL_S = 0.25
 DEFAULT_RETRY_MAX_S = 120.0
 MAX_RETRY_MAX_S = 600.0
 _retx: dict | None = None            # the one cutdown being retried: data, seq, attempts, deadline, next_at
