@@ -22,14 +22,14 @@ LEDs:
     yellow, fast flash              ARMED, release and press again to fire
     yellow solid + red flash        firing, keep holding
     red solid                       transmitting
-    red + yellow + green, all on    TRANSMITTED (10 s). The radio gets no reply, so this means "sent", not "payload cut down"
+    red + yellow + green, all on    TRANSMITTED (1.5 s). The radio gets no reply, so this means "sent", not "payload cut down"
     red, fast flash (10 s)          the send failed
     ALL lights flashing rapidly     ACK: the payload's radio acknowledged the cutdown command (10 s). It means the
                                     radio heard and accepted it, not that the cutdown happened
 
 With only red and green (the default here), everything "yellow" does above is shown on GREEN instead:
 green solid = holding, green fast flash = armed, red and green taking turns = radio fault, red + green on =
-transmitted. If a working third LED is fitted later: FRONT_PANEL_TWO_LEDS=false, FRONT_PANEL_YELLOW_PIN=<its pin>.
+transmitted (1.5 s). If a working third LED is fitted later: FRONT_PANEL_TWO_LEDS=false, FRONT_PANEL_YELLOW_PIN=<its pin>.
 
 Needs FRONT_PANEL_ENABLED=true, RADIO_TX_ENABLED=true, GROUND_CALLSIGN, and a key file (CUTDOWN_KEY_FILE,
 default ~/leos-state/cutdown_key, readable only by this user). Bring-up on the real hardware:
@@ -53,7 +53,8 @@ logger = logging.getLogger(__name__)
 ARM_HOLD_S = 3.0        # hold this long to arm
 FIRE_HOLD_S = 2.0       # hold this long, after arming, to fire
 ARM_WINDOW_S = 10.0     # time allowed between releasing and pressing again
-RESULT_S = 10.0         # how long the sent / failed pattern stays on
+RESULT_S = 10.0         # how long the FAILED pattern stays on
+SENT_S = 1.5            # how long the "sent" pattern (all lights on) stays on, kept short so an ACK flash is clear
 LOCKOUT_S = 3.0         # button ignored after a result
 ACK_FLASH_S = 10.0      # how long the ACK pattern flashes
 DEBOUNCE_S = 0.05
@@ -65,9 +66,10 @@ class ButtonLogic:
     """The button state machine. Pure: feed it the time and whether the button is down."""
 
     def __init__(self, arm_hold_s=ARM_HOLD_S, fire_hold_s=FIRE_HOLD_S, arm_window_s=ARM_WINDOW_S,
-                 result_s=RESULT_S, lockout_s=LOCKOUT_S):
+                 result_s=RESULT_S, lockout_s=LOCKOUT_S, sent_s=SENT_S):
         self.arm_hold_s, self.fire_hold_s = arm_hold_s, fire_hold_s
         self.arm_window_s, self.result_s, self.lockout_s = arm_window_s, result_s, lockout_s
+        self.sent_s = sent_s
         self.state = "wait_release"     # a button already held at boot never arms anything
         self._t0 = 0.0
         self._until = 0.0
@@ -111,7 +113,7 @@ class ButtonLogic:
     def finish(self, now: float, ok: bool) -> None:
         """Call once the send has succeeded or failed."""
         self.state = "result_ok" if ok else "result_fail"
-        self._until = now + self.result_s
+        self._until = now + (self.sent_s if ok else self.result_s)
 
 
 def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True,
