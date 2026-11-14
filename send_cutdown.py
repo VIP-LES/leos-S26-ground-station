@@ -9,6 +9,7 @@ It writes a request file into TX_SPOOL_DIR (default ~/leos-state/tx) and waits f
 to transmit it and report back. The receiver must be running with RADIO_TX_ENABLED=true.
 A request expires after --expires seconds, so it can never fire late. After it is sent, the script waits
 (--ack-wait) for the payload's ACK: the same packet echoed back with the ACK key (cutdown_command.ACK_KEY).
+With --retry-for N the receiver sends the same packet again every ~2 s until the ACK arrives, for up to N seconds.
 
 The key is read from the CUTDOWN_AUTH_KEY environment variable (decimal or 0x hex), or typed at a
 hidden prompt. It is never accepted as a command-line argument, so it does not end up in the
@@ -39,6 +40,8 @@ def main() -> None:
     ap.add_argument("--transmit", action="store_true", help="actually send it (default is a dry run)")
     ap.add_argument("--ack-wait", type=float, default=5.0, help="seconds to wait for the payload's ACK (default 5)")
     ap.add_argument("--expires", type=float, default=30.0, help="seconds before the request is void (default 30)")
+    ap.add_argument("--retry-for", type=float, default=0.0, metavar="SECONDS",
+                    help="keep retransmitting every ~2 s until the ACK arrives, for up to this long (default: send once)")
     args = ap.parse_args()
 
     data = cutdown_command.build_cutdown_packet(authorization_key=read_key(), callsign=args.callsign)
@@ -54,7 +57,8 @@ def main() -> None:
         sys.exit("Cancelled. Nothing was sent.")
 
     tx_dir = cutdown_command.tx_spool_dir()
-    request_id, request_path = cutdown_command.write_request(data, tx_dir, args.expires)
+    request_id, request_path = cutdown_command.write_request(
+        data, tx_dir, args.expires, retry_until_ack=args.retry_for > 0, retry_max_s=args.retry_for or None)
     print(f"Request {request_id} queued, waiting for the receiver to transmit it...")
     result = cutdown_command.wait_for_result(tx_dir, request_id, args.expires + 5)
     if result is None:
@@ -66,8 +70,13 @@ def main() -> None:
     if result["status"] != "sent":
         sys.exit(1)
     sequence = cutdown_command.packet_sequence(data)
-    print(f"Transmitted. Waiting up to {args.ack_wait:g} s for the payload's ACK (sequence {sequence})...")
-    ack = cutdown_command.wait_for_ack(tx_dir, sequence, args.ack_wait)
+    wait_s = args.retry_for + 2 if args.retry_for > 0 else args.ack_wait
+    if args.retry_for > 0:
+        print(f"Transmitted. Retransmitting about every 2 s until the ACK arrives, for up to {args.retry_for:g} s "
+              f"(sequence {sequence})...")
+    else:
+        print(f"Transmitted. Waiting up to {args.ack_wait:g} s for the payload's ACK (sequence {sequence})...")
+    ack = cutdown_command.wait_for_ack(tx_dir, sequence, wait_s)
     if ack is None:
         print("NO ACK received. Either the payload did not hear the command, it rejected it (wrong key), or its "
               "reply was lost.\nThat does not prove it was ignored: check the payload's telemetry and its own log.")

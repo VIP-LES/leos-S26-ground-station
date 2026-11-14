@@ -84,12 +84,22 @@ def new_sequence(state_file: Path | None = None) -> int:
     return sequence
 
 
-def write_request(data: bytes, tx_dir: Path, expires_s: float) -> tuple[str, Path]:
-    """Queue a packet for the receiver to transmit. Returns (request id, request file path)."""
+def write_request(data: bytes, tx_dir: Path, expires_s: float, *, retry_until_ack: bool = False,
+                  retry_max_s: float | None = None) -> tuple[str, Path]:
+    """Queue a packet for the receiver to transmit. Returns (request id, request file path).
+
+    With retry_until_ack the receiver sends the SAME packet again every couple of seconds until the
+    payload's ACK arrives, or retry_max_s runs out (default CUTDOWN_RETRY_MAX_S, 120 s).
+    """
     tx_dir.mkdir(parents=True, exist_ok=True)
     request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     tmp = tx_dir / f"{request_id}.tmp"
-    tmp.write_text(json.dumps({"hex": data.hex(), "expires_at": time.time() + expires_s}))
+    body = {"hex": data.hex(), "expires_at": time.time() + expires_s}
+    if retry_until_ack:
+        body["retry_until_ack"] = True
+        if retry_max_s is not None:
+            body["retry_max_s"] = float(retry_max_s)
+    tmp.write_text(json.dumps(body))
     final = tx_dir / f"{request_id}.request.json"
     os.replace(tmp, final)   # atomic: the receiver never sees a half-written request
     return request_id, final

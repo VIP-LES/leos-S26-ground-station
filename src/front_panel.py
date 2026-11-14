@@ -13,6 +13,9 @@ How to fire (three deliberate steps, so a bump or a pocket press does nothing):
     3. HOLD it again for 2 s                -> the cutdown packet is queued and transmitted
 Releasing early, or letting the 10 s run out, disarms it again.
 
+After it is sent, the receiver keeps retransmitting the same packet every ~2 s until the payload's ACK arrives
+(it gives up after CUTDOWN_RETRY_MAX_S, default 120 s). To stop early, HOLD the button for 2 s while waiting.
+
 LEDs:
     green, brief flash every 2 s    the receiver is running and hearing the payload (last 15 s)
     (nothing)                       not hearing the payload, or the receiver is not running
@@ -21,9 +24,10 @@ LEDs:
     yellow solid                    button held, arming
     yellow, fast flash              ARMED, release and press again to fire
     yellow solid + red flash        firing, keep holding
-    red solid                       transmitting
-    red + yellow + green, all on    TRANSMITTED (1.5 s). The radio gets no reply, so this means "sent", not "payload cut down"
-    red, fast flash (10 s)          the send failed
+    red solid                       transmitting the first time
+    red + green solid               SENT, waiting for the ACK. The green blinks off briefly at every retransmit
+    red + yellow + green, all on    TRANSMITTED, no retries (FRONT_PANEL_RETRY=false), 1.5 s
+    red, fast flash (10 s)          the send failed, or no ACK came before the retries ran out
     ALL lights flashing rapidly     ACK: the payload's radio acknowledged the cutdown command (3 s). It means the
                                     radio heard and accepted it, not that the cutdown happened
 
@@ -57,6 +61,8 @@ RESULT_S = 10.0         # how long the FAILED pattern stays on
 SENT_S = 1.5            # how long the "sent" pattern (all lights on) stays on, kept short so an ACK flash is clear
 LOCKOUT_S = 3.0         # button ignored after a result
 ACK_FLASH_S = 3.0       # how long the ACK pattern flashes
+CANCEL_HOLD_S = 2.0     # hold the button this long while waiting for the ACK to stop the retries
+RETX_BLINK_S = 0.25     # green goes off for this long at each retransmit
 DEBOUNCE_S = 0.05
 LINK_FRESH_S = 15.0     # green only if a packet arrived this recently
 STEP_S = 0.02
@@ -66,16 +72,19 @@ class ButtonLogic:
     """The button state machine. Pure: feed it the time and whether the button is down."""
 
     def __init__(self, arm_hold_s=ARM_HOLD_S, fire_hold_s=FIRE_HOLD_S, arm_window_s=ARM_WINDOW_S,
-                 result_s=RESULT_S, lockout_s=LOCKOUT_S, sent_s=SENT_S):
+                 result_s=RESULT_S, lockout_s=LOCKOUT_S, sent_s=SENT_S, cancel_hold_s=CANCEL_HOLD_S):
         self.arm_hold_s, self.fire_hold_s = arm_hold_s, fire_hold_s
         self.arm_window_s, self.result_s, self.lockout_s = arm_window_s, result_s, lockout_s
         self.sent_s = sent_s
         self.state = "wait_release"     # a button already held at boot never arms anything
         self._t0 = 0.0
         self._until = 0.0
+        self.cancel_hold_s = cancel_hold_s
+        self._released_since_fire = False
 
     def update(self, now: float, pressed: bool) -> str | None:
-        """Advance the machine. Returns "fire" exactly once, when the second hold completes."""
+        """Advance the machine. Returns "fire" exactly once, when the second hold completes, and "cancel"
+        once if the button is held for cancel_hold_s while waiting for the ACK."""
         s = self.state
         if s == "wait_release":
             if not pressed:
@@ -102,6 +111,16 @@ class ButtonLogic:
             elif now - self._t0 >= self.fire_hold_s:
                 self.state = "sending"
                 return "fire"
+        elif s == "waiting_ack":
+            if not pressed:
+                self._released_since_fire = True          # the button that fired it must come up first
+                self._t0 = None
+            elif self._released_since_fire:
+                if self._t0 is None:
+                    self._t0 = now
+                elif now - self._t0 >= self.cancel_hold_s:
+                    self.state, self._until = "lockout", now + self.lockout_s
+                    return "cancel"
         elif s in ("result_ok", "result_fail"):
             if now >= self._until:
                 self.state, self._until = "lockout", now + self.lockout_s
@@ -110,14 +129,17 @@ class ButtonLogic:
                 self.state = "idle"
         return None                                      # "sending" waits for finish()
 
-    def finish(self, now: float, ok: bool) -> None:
-        """Call once the send has succeeded or failed."""
+    def finish(self, now: float, ok: bool, waiting: bool = False) -> None:
+        """Call once the send has succeeded or failed. waiting=True: sent, now wait for the ACK (retries running)."""
+        if ok and waiting:
+            self.state, self._t0, self._released_since_fire = "waiting_ack", None, False
+            return
         self.state = "result_ok" if ok else "result_fail"
         self._until = now + (self.sent_s if ok else self.result_s)
 
 
 def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True,
-               two_leds: bool = False, ack_active: bool = False) -> dict[str, bool]:
+               two_leds: bool = False, ack_active: bool = False, retx_blink: bool = False) -> dict[str, bool]:
     """Which LEDs are on, for a given state and time. With two_leds, yellow is shown on green instead."""
     fast = int(now * 5) % 2 == 0          # about 2.5 flashes a second
     leds = {"red": False, "yellow": False, "green": False}
@@ -137,6 +159,8 @@ def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok:
         leds["yellow"], leds["red"] = True, fast
     elif state == "sending":
         leds["red"] = True
+    elif state == "waiting_ack":
+        leds["red"], leds["green"] = True, not retx_blink     # green blinks off at each retransmit
     elif state == "result_ok":
         leds = {"red": True, "yellow": True, "green": True}
     elif state == "result_fail":
@@ -219,6 +243,9 @@ class FrontPanel:
         self.gpio, self.status, self.practice, self.expires_s = gpio, status, practice, expires_s
         self.two_leds = _two_leds_from_env() if two_leds is None else two_leds
         self._practice_ack_at = None
+        self._practice_wait = None      # practice mode: pretend retries {"next", "ack_at"}
+        self._seq = None                # sequence of the cutdown we asked to send
+        self.retry = os.environ.get("FRONT_PANEL_RETRY", "true").strip().lower() != "false"
         self.logic = logic or ButtonLogic()
         self._pending = None            # (request id, spool dir, request path, give-up time)
         self._raw, self._raw_since, self._stable = False, 0.0, False
@@ -264,7 +291,9 @@ class FrontPanel:
             key, callsign = load_cutdown_config()
             data = cutdown_command.build_cutdown_packet(authorization_key=key, callsign=callsign)
             tx_dir = cutdown_command.tx_spool_dir()
-            request_id, path = cutdown_command.write_request(data, tx_dir, self.expires_s)
+            request_id, path = cutdown_command.write_request(data, tx_dir, self.expires_s,
+                                                              retry_until_ack=self.retry)
+            self._seq = cutdown_command.packet_sequence(data)
         except Exception as exc:
             logger.error("FRONT PANEL: cutdown NOT sent: %s", exc)
             self.logic.finish(now, False)
@@ -277,8 +306,12 @@ class FrontPanel:
         if request_id == "practice":
             if now >= give_up:
                 self._pending = None
-                self.logic.finish(now, True)
-                self._practice_ack_at = now + 3.0          # pretend the payload answers 3 s later
+                if self.retry:
+                    self.logic.finish(now, True, waiting=True)
+                    self._practice_wait = {"next": now + 2.0, "ack_at": now + 5.0}   # pretend: ACK on the 3rd try
+                else:
+                    self.logic.finish(now, True)
+                    self._practice_ack_at = now + 3.0      # pretend the payload answers 3 s later
             return
         result = cutdown_command.check_result(tx_dir, request_id)
         if result is not None:
@@ -286,19 +319,51 @@ class FrontPanel:
             (logger.warning if ok else logger.error)(
                 "FRONT PANEL: cutdown %s (%s)", result.get("status"), result.get("detail"))
             self._pending = None
-            self.logic.finish(now, ok)
+            self.logic.finish(now, ok, waiting=ok and self.retry)
         elif now > give_up:
             path.unlink(missing_ok=True)   # withdrawn, so it can never be sent late
             logger.error("FRONT PANEL: no answer from the receiver; the request was withdrawn")
             self._pending = None
             self.logic.finish(now, False)
 
+    def _check_wait(self, now: float) -> None:
+        """While waiting for the ACK: end the wait when the receiver says it is over."""
+        if self.practice:
+            wait = self._practice_wait
+            if wait is None:
+                return
+            if now >= wait["ack_at"]:
+                self._practice_wait = None
+                self.status["ack_at"] = now
+                logger.warning("FRONT PANEL PRACTICE: pretend ACK received")
+                self.logic.finish(now, True)
+            elif now >= wait["next"]:
+                wait["next"] += 2.0
+                self.status["retx_at"] = now
+                logger.warning("FRONT PANEL PRACTICE: pretend retransmit")
+            return
+        if self.status.get("cutdown_wait") == self._seq:
+            return                                        # the receiver is still retrying
+        outcome = self.status.get("cutdown_outcome") or {}
+        acked = outcome.get("seq") == self._seq and outcome.get("result") == "acked"
+        (logger.warning if acked else logger.error)(
+            "FRONT PANEL: cutdown %s", "ACKed by the payload" if acked else
+            f"NOT acknowledged ({outcome.get('result') or 'the receiver stopped retrying'})")
+        self.logic.finish(now, acked)
+
     def step(self, now: float) -> None:
         pressed = self._debounced(now, self.gpio.read_button())
-        if self.logic.update(now, pressed) == "fire":
+        action = self.logic.update(now, pressed)
+        if action == "fire":
             self._start_fire(now)
+        elif action == "cancel":
+            logger.warning("FRONT PANEL: button held, cutdown retries cancelled")
+            self._practice_wait = None
+            self.status["cancel_cutdown"] = True
         if self._pending is not None:
             self._poll_pending(now)
+        if self.logic.state == "waiting_ack":
+            self._check_wait(now)
         if self.logic.state != self._last_state:
             logger.info("Front panel: %s", self.logic.state)
             self._last_state = self.logic.state
@@ -308,8 +373,10 @@ class FrontPanel:
             logger.warning("FRONT PANEL PRACTICE: pretend ACK received")
         ack_at = self.status.get("ack_at")
         ack_active = ack_at is not None and 0 <= now - ack_at < ACK_FLASH_S
+        retx_at = self.status.get("retx_at")
+        retx_blink = retx_at is not None and 0 <= now - retx_at < RETX_BLINK_S
         leds = led_levels(self.logic.state, now, self.link_ok(now), self.config_ok,
-                          self.status.get("radio_ok", True), self.two_leds, ack_active)
+                          self.status.get("radio_ok", True), self.two_leds, ack_active, retx_blink)
         if leds != self._last_leds:
             self.gpio.write_leds(leds)
             self._last_leds = leds
@@ -378,6 +445,13 @@ def _bring_up(mode: str) -> None:
             t_end = time.monotonic() + 3.0
             while time.monotonic() < t_end:
                 gpio.write_leds(led_levels("idle", time.monotonic(), True, True, True, gpio.two_leds, True))
+                time.sleep(STEP_S)
+            print("  waiting-for-ACK pattern: red + green solid, green blinks off once a second, for 4 s")
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 4.0:
+                t = time.monotonic() - t0
+                gpio.write_leds(led_levels("waiting_ack", t, True, True, True, gpio.two_leds, False,
+                                           retx_blink=(t % 1.0) < RETX_BLINK_S))
                 time.sleep(STEP_S)
             gpio.write_leds({"red": False, "yellow": False, "green": False})
             print("Press and release the button. It should say PRESSED while held.")

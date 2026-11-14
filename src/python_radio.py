@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import shlex
 import threading
 import time
@@ -48,6 +49,93 @@ DEFAULT_TX_POWER_DBM = 10
 ACK_MATCH_WINDOW_S = 120.0     # an ACK counts only for a command this receiver transmitted this recently
 _recent_tx: dict[int, float] = {}   # sequence -> time.monotonic() of each command we sent
 
+# Retransmit-until-ACK (a request with retry_until_ack): the SAME packet is sent again every RETRY_INTERVAL_S
+# (randomised a little, so it never stays in step with the payload's own once-a-second telemetry) until the
+# payload's ACK arrives or CUTDOWN_RETRY_MAX_S runs out, or it is cancelled from the front panel.
+DEFAULT_RETRY_INTERVAL_S = 2.0
+DEFAULT_RETRY_MAX_S = 120.0
+MAX_RETRY_MAX_S = 600.0
+_retx: dict | None = None            # the one cutdown being retried: data, seq, attempts, deadline, next_at
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _next_gap() -> float:
+    interval = max(1.0, _env_float("CUTDOWN_RETRY_INTERVAL_S", DEFAULT_RETRY_INTERVAL_S))
+    return interval * random.uniform(0.8, 1.2)
+
+
+def _start_retx(data: bytes, sequence: int, request: dict, panel_status: dict | None) -> None:
+    global _retx
+    max_s = min(MAX_RETRY_MAX_S, max(1.0, float(request.get("retry_max_s")
+                                                or _env_float("CUTDOWN_RETRY_MAX_S", DEFAULT_RETRY_MAX_S))))
+    now = time.monotonic()
+    if _retx is not None:
+        logger.warning("A new cutdown request replaces the one still being retried (sequence %d)", _retx["seq"])
+    _retx = {"data": data, "seq": sequence, "attempts": 1, "deadline": now + max_s, "next_at": now + _next_gap()}
+    if panel_status is not None:
+        panel_status["cutdown_wait"] = sequence
+        panel_status.pop("cutdown_outcome", None)
+        panel_status["cancel_cutdown"] = False
+    logger.warning("Cutdown sequence %d will be retransmitted about every %.0f s until the ACK arrives (up to %.0f s)",
+                   sequence, _env_float("CUTDOWN_RETRY_INTERVAL_S", DEFAULT_RETRY_INTERVAL_S), max_s)
+
+
+def _end_retx(panel_status: dict | None, result: str) -> None:
+    """Stop retrying. result is "acked", "gave_up" or "cancelled"."""
+    global _retx
+    if _retx is None:
+        return
+    sequence, _retx = _retx["seq"], None
+    if panel_status is not None:
+        panel_status["cutdown_wait"] = None
+        panel_status["cutdown_outcome"] = {"seq": sequence, "result": result, "at": time.monotonic()}
+
+
+def service_retransmits(radio, stats: dict, panel_status: dict | None = None) -> None:
+    """Send the pending cutdown again if it is time. Call it often; it is cheap when nothing is pending."""
+    if _retx is None:
+        return
+    now = time.monotonic()
+    if panel_status is not None and panel_status.get("cancel_cutdown"):
+        panel_status["cancel_cutdown"] = False
+        logger.warning("Cutdown retries cancelled after %d transmission(s), no ACK (sequence %d)",
+                       _retx["attempts"], _retx["seq"])
+        _end_retx(panel_status, "cancelled")
+        return
+    if os.environ.get("RADIO_TX_ENABLED", "").strip().lower() != "true":
+        logger.error("Cutdown retries stopped: transmitting is disabled (RADIO_TX_ENABLED is not true)")
+        _end_retx(panel_status, "gave_up")
+        return
+    if now >= _retx["deadline"]:
+        logger.error("NO ACK for cutdown sequence %d after %d transmission(s): giving up",
+                     _retx["seq"], _retx["attempts"])
+        _end_retx(panel_status, "gave_up")
+        return
+    if now < _retx["next_at"]:
+        return
+
+    from radio.radio_tx import TransmitError, transmit
+
+    power = int(os.environ.get("RADIO_TX_POWER_DBM", DEFAULT_TX_POWER_DBM))
+    try:
+        transmit(radio, _retx["data"], power_dbm=power)
+    except TransmitError as exc:
+        logger.error("Cutdown retransmit failed (%s); will try again", exc)
+    else:
+        _retx["attempts"] += 1
+        stats["tx_sent"] = stats.get("tx_sent", 0) + 1
+        _recent_tx[_retx["seq"]] = time.monotonic()        # keeps the ACK match window open
+        if panel_status is not None:
+            panel_status["retx_at"] = time.monotonic()      # the front panel blinks green on this
+        logger.warning("Cutdown retransmit #%d (sequence %d): no ACK yet", _retx["attempts"], _retx["seq"])
+    _retx["next_at"] = time.monotonic() + _next_gap()
+
 
 def tx_spool_dir() -> Path:
     return Path(os.environ.get("TX_SPOOL_DIR") or "~/leos-state/tx").expanduser()
@@ -61,7 +149,7 @@ def _write_result(tx_dir: Path, request_id: str, status: str, detail: str = "") 
     os.replace(tmp, tx_dir / f"{request_id}.result.json")
 
 
-def service_tx_requests(radio, tx_dir: Path, stats: dict) -> None:
+def service_tx_requests(radio, tx_dir: Path, stats: dict, panel_status: dict | None = None) -> None:
     """Handle at most one pending transmit request. Every outcome is written to a result file.
 
     A request is sent only if ALL of these hold: RADIO_TX_ENABLED=true, it has not expired, and
@@ -114,6 +202,8 @@ def service_tx_requests(radio, tx_dir: Path, stats: dict) -> None:
                 status, detail = "sent", f"{len(data)} bytes at {power} dBm"
                 stats["tx_sent"] = stats.get("tx_sent", 0) + 1
                 _recent_tx[packet.sequence] = time.monotonic()
+                if request.get("retry_until_ack"):
+                    _start_retx(data, packet.sequence, request, panel_status)
 
     log = logger.warning if status == "sent" else logger.error
     log("Uplink request %s: %s (%s)", request_id, status, detail)
@@ -131,6 +221,10 @@ def _handle_ack(ack: dict, rssi, snr, status: dict, tx_dir: Path, stats: dict) -
         return "ack_unmatched"
     stats["acks"] = stats.get("acks", 0) + 1
     status["ack_at"] = now
+    if _retx is not None and ack["sequence"] == _retx["seq"]:
+        logger.warning("ACK arrived after %d transmission(s) of sequence %d: retries stopped",
+                       _retx["attempts"], ack["sequence"])
+        _end_retx(status, "acked")
     cutdown_command.write_ack(tx_dir, {**ack, "rssi": rssi, "snr": snr, "t": time.time()})
     for old in tx_dir.glob("*.ack.json"):               # tidy up ACK files nobody collected
         try:
@@ -197,7 +291,8 @@ def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir, plog
         if pkt is None:
             if time.monotonic() - last_tx_check >= TX_CHECK_S:
                 last_tx_check = time.monotonic()
-                service_tx_requests(radio, tx_dir, stats)
+                service_tx_requests(radio, tx_dir, stats, status)
+            service_retransmits(radio, stats, status)
             time.sleep(POLL_SLEEP_S)
         else:
             stats["received"] += 1
@@ -210,19 +305,24 @@ def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir, plog
             else:
                 frame = bytes.fromhex(pkt["hex"])
                 entry["len"] = len(frame)
+                received_at = datetime.now(timezone.utc)
                 ack = cutdown_command.parse_ack(frame)
                 if ack is not None:
                     entry["hex"] = None                       # ACK bytes are not logged, like command bytes
                     entry["callsign"], entry["seq"] = ack["callsign"], ack["sequence"]
                     entry["outcome"] = _handle_ack(ack, pkt.get("rssi"), pkt.get("snr"), status, tx_dir, stats)
                     status["last_rx"] = time.monotonic()
+                    if pkt.get("rssi") is not None or pkt.get("snr") is not None:
+                        queue_writer.enqueue(queue_path, "radio_link", {      # the ACK's signal strength too
+                            "time": received_at.isoformat(), "rssi": pkt.get("rssi"), "snr": pkt.get("snr"),
+                            "callsign": ack["callsign"], "sequence": ack["sequence"],
+                        })
                     if plog is not None:
                         plog.record(entry)
                     continue
                 if _is_command(frame):
                     entry["hex"] = None            # the raw bytes would contain the cutdown key
                     entry["outcome"] = "command_heard_bytes_not_logged"
-                received_at = datetime.now(timezone.utc)
                 try:
                     messages = decode_radio_messages(frame, received_at)
                 except Exception as exc:
