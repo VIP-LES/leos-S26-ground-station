@@ -7,7 +7,8 @@
 How it sends: the receiver (index.py) owns the radio, so this script does not touch the radio.
 It writes a request file into TX_SPOOL_DIR (default ~/leos-state/tx) and waits for the receiver
 to transmit it and report back. The receiver must be running with RADIO_TX_ENABLED=true.
-A request expires after --expires seconds, so it can never fire late.
+A request expires after --expires seconds, so it can never fire late. After it is sent, the script waits
+(--ack-wait) for the payload's ACK: the same packet echoed back with the ACK key (cutdown_command.ACK_KEY).
 
 The key is read from the CUTDOWN_AUTH_KEY environment variable (decimal or 0x hex), or typed at a
 hidden prompt. It is never accepted as a command-line argument, so it does not end up in the
@@ -36,6 +37,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Build (and optionally send) a cutdown command.")
     ap.add_argument("--callsign", required=True, help="your callsign, at most 16 ASCII characters")
     ap.add_argument("--transmit", action="store_true", help="actually send it (default is a dry run)")
+    ap.add_argument("--ack-wait", type=float, default=5.0, help="seconds to wait for the payload's ACK (default 5)")
     ap.add_argument("--expires", type=float, default=30.0, help="seconds before the request is void (default 30)")
     args = ap.parse_args()
 
@@ -63,7 +65,15 @@ def main() -> None:
     print(f"Result: {result['status']}: {result['detail']}")
     if result["status"] != "sent":
         sys.exit(1)
-    print("Transmitted. The radio gives no acknowledgement; check the payload's telemetry before assuming it worked.")
+    sequence = cutdown_command.packet_sequence(data)
+    print(f"Transmitted. Waiting up to {args.ack_wait:g} s for the payload's ACK (sequence {sequence})...")
+    ack = cutdown_command.wait_for_ack(tx_dir, sequence, args.ack_wait)
+    if ack is None:
+        print("NO ACK received. Either the payload did not hear the command, it rejected it (wrong key), or its "
+              "reply was lost.\nThat does not prove it was ignored: check the payload's telemetry and its own log.")
+        sys.exit(2)
+    print(f"ACK received from {ack['callsign']} (rssi={ack.get('rssi')} snr={ack.get('snr')}): the payload's radio "
+          "accepted the command.\nThis does not confirm the cutdown itself happened: check telemetry and the payload.")
 
 
 if __name__ == "__main__":

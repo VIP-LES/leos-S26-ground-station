@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import cutdown_command
 from src import packet_log, queue_writer
 from src.protobuf_decoder import decode_radio_messages, parse_packet
 
@@ -44,6 +45,8 @@ STATS_INTERVAL_S = 10.0
 TX_CHECK_S = 0.2
 OPEN_RETRY_S = 5.0
 DEFAULT_TX_POWER_DBM = 10
+ACK_MATCH_WINDOW_S = 120.0     # an ACK counts only for a command this receiver transmitted this recently
+_recent_tx: dict[int, float] = {}   # sequence -> time.monotonic() of each command we sent
 
 
 def tx_spool_dir() -> Path:
@@ -110,10 +113,34 @@ def service_tx_requests(radio, tx_dir: Path, stats: dict) -> None:
             else:
                 status, detail = "sent", f"{len(data)} bytes at {power} dBm"
                 stats["tx_sent"] = stats.get("tx_sent", 0) + 1
+                _recent_tx[packet.sequence] = time.monotonic()
 
     log = logger.warning if status == "sent" else logger.error
     log("Uplink request %s: %s (%s)", request_id, status, detail)
     _write_result(tx_dir, request_id, status, detail)
+
+
+def _handle_ack(ack: dict, rssi, snr, status: dict, tx_dir: Path, stats: dict) -> str:
+    """The payload acknowledged a command. Only an ACK for a command WE sent recently counts."""
+    now = time.monotonic()
+    for seq in [q for q, t in _recent_tx.items() if now - t > ACK_MATCH_WINDOW_S]:
+        del _recent_tx[seq]
+    if ack["sequence"] not in _recent_tx:
+        logger.warning("ACK from %s for sequence %d, which we did not send recently: ignored (rssi=%s snr=%s)",
+                       ack["callsign"], ack["sequence"], rssi, snr)
+        return "ack_unmatched"
+    stats["acks"] = stats.get("acks", 0) + 1
+    status["ack_at"] = now
+    cutdown_command.write_ack(tx_dir, {**ack, "rssi": rssi, "snr": snr, "t": time.time()})
+    for old in tx_dir.glob("*.ack.json"):               # tidy up ACK files nobody collected
+        try:
+            if time.time() - old.stat().st_mtime > 3600:
+                old.unlink()
+        except OSError:
+            pass
+    logger.warning("ACK RECEIVED from %s for command sequence %d (rssi=%s snr=%s): the payload's radio "
+                   "accepted the cutdown command", ack["callsign"], ack["sequence"], rssi, snr)
+    return "ack_received"
 
 
 def _open_radio():
@@ -183,6 +210,15 @@ def _receive_loop(radio, queue_path, stop, stats, last_seq, status, tx_dir, plog
             else:
                 frame = bytes.fromhex(pkt["hex"])
                 entry["len"] = len(frame)
+                ack = cutdown_command.parse_ack(frame)
+                if ack is not None:
+                    entry["hex"] = None                       # ACK bytes are not logged, like command bytes
+                    entry["callsign"], entry["seq"] = ack["callsign"], ack["sequence"]
+                    entry["outcome"] = _handle_ack(ack, pkt.get("rssi"), pkt.get("snr"), status, tx_dir, stats)
+                    status["last_rx"] = time.monotonic()
+                    if plog is not None:
+                        plog.record(entry)
+                    continue
                 if _is_command(frame):
                     entry["hex"] = None            # the raw bytes would contain the cutdown key
                     entry["outcome"] = "command_heard_bytes_not_logged"

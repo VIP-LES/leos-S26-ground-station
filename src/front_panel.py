@@ -24,6 +24,8 @@ LEDs:
     red solid                       transmitting
     red + yellow + green, all on    TRANSMITTED (10 s). The radio gets no reply, so this means "sent", not "payload cut down"
     red, fast flash (10 s)          the send failed
+    ALL lights flashing rapidly     ACK: the payload's radio acknowledged the cutdown command (10 s). It means the
+                                    radio heard and accepted it, not that the cutdown happened
 
 With only red and green (the default here), everything "yellow" does above is shown on GREEN instead:
 green solid = holding, green fast flash = armed, red and green taking turns = radio fault, red + green on =
@@ -53,6 +55,7 @@ FIRE_HOLD_S = 2.0       # hold this long, after arming, to fire
 ARM_WINDOW_S = 10.0     # time allowed between releasing and pressing again
 RESULT_S = 10.0         # how long the sent / failed pattern stays on
 LOCKOUT_S = 3.0         # button ignored after a result
+ACK_FLASH_S = 10.0      # how long the ACK pattern flashes
 DEBOUNCE_S = 0.05
 LINK_FRESH_S = 15.0     # green only if a packet arrived this recently
 STEP_S = 0.02
@@ -112,7 +115,7 @@ class ButtonLogic:
 
 
 def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok: bool = True,
-               two_leds: bool = False) -> dict[str, bool]:
+               two_leds: bool = False, ack_active: bool = False) -> dict[str, bool]:
     """Which LEDs are on, for a given state and time. With two_leds, yellow is shown on green instead."""
     fast = int(now * 5) % 2 == 0          # about 2.5 flashes a second
     leds = {"red": False, "yellow": False, "green": False}
@@ -136,6 +139,9 @@ def led_levels(state: str, now: float, link_ok: bool, config_ok: bool, radio_ok:
         leds = {"red": True, "yellow": True, "green": True}
     elif state == "result_fail":
         leds["red"] = fast
+    if ack_active and state in ("wait_release", "idle", "lockout", "result_ok", "result_fail"):
+        on = int(now * 10) % 2 == 0           # 5 flashes a second: faster than "armed", all lights together
+        leds = {"red": on, "yellow": on, "green": on}
     if two_leds:
         leds["green"] = leds["green"] or leds["yellow"]
         leds["yellow"] = False
@@ -210,6 +216,7 @@ class FrontPanel:
                  logic: ButtonLogic | None = None, two_leds: bool | None = None):
         self.gpio, self.status, self.practice, self.expires_s = gpio, status, practice, expires_s
         self.two_leds = _two_leds_from_env() if two_leds is None else two_leds
+        self._practice_ack_at = None
         self.logic = logic or ButtonLogic()
         self._pending = None            # (request id, spool dir, request path, give-up time)
         self._raw, self._raw_since, self._stable = False, 0.0, False
@@ -269,6 +276,7 @@ class FrontPanel:
             if now >= give_up:
                 self._pending = None
                 self.logic.finish(now, True)
+                self._practice_ack_at = now + 3.0          # pretend the payload answers 3 s later
             return
         result = cutdown_command.check_result(tx_dir, request_id)
         if result is not None:
@@ -292,8 +300,14 @@ class FrontPanel:
         if self.logic.state != self._last_state:
             logger.info("Front panel: %s", self.logic.state)
             self._last_state = self.logic.state
+        if self._practice_ack_at is not None and now >= self._practice_ack_at:
+            self.status["ack_at"] = now
+            self._practice_ack_at = None
+            logger.warning("FRONT PANEL PRACTICE: pretend ACK received")
+        ack_at = self.status.get("ack_at")
+        ack_active = ack_at is not None and 0 <= now - ack_at < ACK_FLASH_S
         leds = led_levels(self.logic.state, now, self.link_ok(now), self.config_ok,
-                          self.status.get("radio_ok", True), self.two_leds)
+                          self.status.get("radio_ok", True), self.two_leds, ack_active)
         if leds != self._last_leds:
             self.gpio.write_leds(leds)
             self._last_leds = leds
@@ -358,6 +372,11 @@ def _bring_up(mode: str) -> None:
                     print(f"  {name} ON (pin {gpio.pins[name]})")
                     time.sleep(1.0)
             gpio.write_leds({"red": True, "yellow": True, "green": True}); print("  all ON"); time.sleep(1.0)
+            print("  ACK pattern (all lights flashing rapidly) for 3 s")
+            t_end = time.monotonic() + 3.0
+            while time.monotonic() < t_end:
+                gpio.write_leds(led_levels("idle", time.monotonic(), True, True, True, gpio.two_leds, True))
+                time.sleep(STEP_S)
             gpio.write_leds({"red": False, "yellow": False, "green": False})
             print("Press and release the button. It should say PRESSED while held.")
             last, end = None, time.monotonic() + 30

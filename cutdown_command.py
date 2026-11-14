@@ -23,6 +23,11 @@ from pathlib import Path
 
 CALLSIGN_MAX = 16  # packet.options: callsign max_size 17 including the terminating NUL
 
+# The payload's radio acknowledges an authorized cutdown command by sending the SAME packet back (same
+# callsign and sequence) with this key in place of the real one. It is a command packet on the wire, so the
+# only thing that makes it an ACK is this value. It must never equal the key the payload accepts as a command.
+ACK_KEY = 0xBEEFDEAD
+
 
 def _generated_dir() -> Path:
     root = os.environ.get("LEOS_PROTOBUF_PATH")
@@ -115,6 +120,8 @@ def wait_for_result(tx_dir: Path, request_id: str, wait_s: float) -> dict | None
 
 def build_cutdown_packet(*, authorization_key: int, callsign: str, sequence: int | None = None) -> bytes:
     """Serialize a cutdown command into the bytes that go over the radio."""
+    if authorization_key == ACK_KEY:
+        raise ValueError("that key is reserved for the payload's acknowledgement, not for commands")
     if not 0 < authorization_key <= 0xFFFFFFFF:
         # 0 is rejected on purpose: proto3 leaves a zero out, so it is indistinguishable from "no key".
         raise ValueError("authorization_key must be a non-zero 32-bit number")
@@ -144,3 +151,55 @@ def describe(data: bytes) -> str:
         return f"command from {packet.callsign}: {which}"
     key = packet.command.cutdown.authorization_key
     return f"CUTDOWN from {packet.callsign} | sequence={packet.sequence} | key={'set' if key else 'MISSING'}"
+
+
+def packet_sequence(data: bytes) -> int:
+    """The sequence number inside a packet (used to match the payload's ACK to the command sent)."""
+    packet = _load_packet_module().Packet()
+    packet.ParseFromString(data)
+    return packet.sequence
+
+
+def parse_ack(frame: bytes) -> dict | None:
+    """If ``frame`` is the payload's acknowledgement, return {callsign, sequence}; otherwise None. Never raises."""
+    try:
+        packet = _load_packet_module().Packet()
+        if packet.ParseFromString(frame) != len(frame):
+            return None
+        if packet.WhichOneof("payload") != "command" or packet.command.WhichOneof("data") != "cutdown":
+            return None
+        if packet.command.cutdown.authorization_key != ACK_KEY:
+            return None
+        return {"callsign": packet.callsign, "sequence": packet.sequence}
+    except Exception:
+        return None
+
+
+def write_ack(tx_dir: Path, ack: dict) -> None:
+    """Record a matched ACK for send_cutdown.py to pick up. Atomic, like the other spool files."""
+    tx_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tx_dir / f"{ack['sequence']}.ack.tmp"
+    tmp.write_text(json.dumps(ack))
+    os.replace(tmp, tx_dir / f"{ack['sequence']}.ack.json")
+
+
+def check_ack(tx_dir: Path, sequence: int) -> dict | None:
+    path = tx_dir / f"{sequence}.ack.json"
+    if not path.exists():
+        return None
+    try:
+        ack = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    path.unlink(missing_ok=True)
+    return ack
+
+
+def wait_for_ack(tx_dir: Path, sequence: int, wait_s: float) -> dict | None:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        ack = check_ack(tx_dir, sequence)
+        if ack is not None:
+            return ack
+        time.sleep(0.1)
+    return None
