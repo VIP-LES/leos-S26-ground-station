@@ -24,7 +24,7 @@ LEDs:
     red solid                       transmitting
     red + yellow + green, all on    TRANSMITTED (1.5 s). The radio gets no reply, so this means "sent", not "payload cut down"
     red, fast flash (10 s)          the send failed
-    ALL lights flashing rapidly     ACK: the payload's radio acknowledged the cutdown command (10 s). It means the
+    ALL lights flashing rapidly     ACK: the payload's radio acknowledged the cutdown command (3 s). It means the
                                     radio heard and accepted it, not that the cutdown happened
 
 With only red and green (the default here), everything "yellow" does above is shown on GREEN instead:
@@ -56,7 +56,7 @@ ARM_WINDOW_S = 10.0     # time allowed between releasing and pressing again
 RESULT_S = 10.0         # how long the FAILED pattern stays on
 SENT_S = 1.5            # how long the "sent" pattern (all lights on) stays on, kept short so an ACK flash is clear
 LOCKOUT_S = 3.0         # button ignored after a result
-ACK_FLASH_S = 10.0      # how long the ACK pattern flashes
+ACK_FLASH_S = 3.0       # how long the ACK pattern flashes
 DEBOUNCE_S = 0.05
 LINK_FRESH_S = 15.0     # green only if a packet arrived this recently
 STEP_S = 0.02
